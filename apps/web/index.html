@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ApexGraph — Code Knowledge Graph & Intelligence Platform</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <!-- Top Navigation & Context Bar -->
+  <header>
+    <div class="brand">
+      <span class="brand-badge">APEX</span>
+      <span class="brand-title">ApexGraph</span>
+    </div>
+
+    <div class="context-bar">
+      <div class="select-group">
+        <label for="workspace-select">Workspace:</label>
+        <select id="workspace-select"></select>
+        <button class="btn" id="btn-new-workspace" title="New Workspace">+</button>
+      </div>
+
+      <div class="select-group">
+        <label for="repo-select">Repository:</label>
+        <select id="repo-select"></select>
+        <button class="btn btn-primary" id="btn-register-repo">+ Add Repository</button>
+      </div>
+
+      <button class="btn" id="btn-reindex-repo" title="Re-index current repository">
+        <span>↻</span> Re-Index
+      </button>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-tab="overview">Overview</button>
+    <button class="nav-tab" data-tab="graph">Graph Explorer</button>
+    <button class="nav-tab" data-tab="search">Symbol Search</button>
+    <button class="nav-tab" data-tab="impact">Change Impact</button>
+    <button class="nav-tab" data-tab="mcp">MCP Setup</button>
+    <button class="nav-tab" data-tab="architecture">Architecture</button>
+  </nav>
+
+  <!-- Main View Stage -->
+  <main>
+
+    <!-- 1. Overview Dashboard View -->
+    <section id="overview-view" class="view-panel active">
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-title">Indexing Status</div>
+          <div class="metric-value" id="metric-status"><span class="status-badge status-pending">PENDING</span></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-title">Source Files</div>
+          <div class="metric-value" id="metric-files">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-title">Total Code Lines</div>
+          <div class="metric-value" id="metric-lines">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-title">Graph Nodes</div>
+          <div class="metric-value" id="metric-nodes">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-title">Graph Edges</div>
+          <div class="metric-value" id="metric-edges">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-title">Indexing Duration</div>
+          <div class="metric-value" id="metric-duration">0.00s</div>
+        </div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem;">
+        <div class="section-card">
+          <div class="section-title">Languages Breakdown</div>
+          <div id="languages-container">
+            <p style="color: var(--text-muted);">No repository indexed yet.</p>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <div class="section-title">Node Types Distribution</div>
+          <div id="nodetypes-container">
+            <p style="color: var(--text-muted);">No repository indexed yet.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-title">Diagnostics & Warnings</div>
+        <div id="diagnostics-container">
+          <p style="color: var(--text-muted);">Clean index. Zero parsing warnings reported.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. Graph Explorer View -->
+    <section id="graph-view" class="view-panel">
+      <aside class="graph-sidebar">
+        <div>
+          <label style="font-size: 0.8rem; font-weight: 600; text-transform: uppercase; color: var(--text-secondary);">Center On Symbol</label>
+          <input type="text" id="graph-search-input" placeholder="e.g. Calculator, add" style="width: 100%; margin-top: 0.35rem;">
+        </div>
+
+        <div>
+          <label style="font-size: 0.8rem; font-weight: 600; text-transform: uppercase; color: var(--text-secondary);">Hop Radius: <span id="radius-val">1</span></label>
+          <input type="range" id="graph-radius-slider" min="1" max="2" value="1" style="width: 100%; margin-top: 0.35rem;">
+        </div>
+
+        <div>
+          <label style="font-size: 0.8rem; font-weight: 600; text-transform: uppercase; color: var(--text-secondary); margin-bottom: 0.5rem; display: block;">Node Types</label>
+          <div style="display: flex; flex-direction: column; gap: 0.4rem; font-size: 0.85rem;">
+            <label><input type="checkbox" class="node-filter" value="FUNCTION" checked> <span style="color: var(--color-function);">●</span> Functions</label>
+            <label><input type="checkbox" class="node-filter" value="METHOD" checked> <span style="color: var(--color-method);">●</span> Methods</label>
+            <label><input type="checkbox" class="node-filter" value="CLASS" checked> <span style="color: var(--color-class);">●</span> Classes</label>
+            <label><input type="checkbox" class="node-filter" value="INTERFACE" checked> <span style="color: var(--color-interface);">●</span> Interfaces</label>
+            <label><input type="checkbox" class="node-filter" value="FILE" checked> <span style="color: var(--color-file);">●</span> Files</label>
+            <label><input type="checkbox" class="node-filter" value="TEST" checked> <span style="color: var(--color-test);">●</span> Tests</label>
+          </div>
+        </div>
+
+        <div style="margin-top: auto; font-size: 0.75rem; color: var(--text-muted);">
+          <p><strong>Controls:</strong></p>
+          <p>• Click node: Inspect details</p>
+          <p>• Double-click: Expand neighbors</p>
+          <p>• Drag: Pan viewport</p>
+          <p>• Scroll: Zoom in/out</p>
+        </div>
+      </aside>
+
+      <div class="graph-stage">
+        <canvas id="graph-canvas"></canvas>
+        <div class="graph-controls">
+          <button class="btn" id="btn-zoom-in">+</button>
+          <button class="btn" id="btn-zoom-out">-</button>
+          <button class="btn" id="btn-zoom-reset">Reset</button>
+        </div>
+      </div>
+
+      <aside class="graph-inspector" id="graph-inspector">
+        <div class="inspector-header">
+          <span class="node-badge" id="insp-badge" style="background: var(--bg-surface);">SELECT A NODE</span>
+          <h3 id="insp-name" style="margin-top: 0.4rem; font-size: 1.1rem; word-break: break-all;">No Node Selected</h3>
+          <p id="insp-file" style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.2rem;">Click any node in graph</p>
+        </div>
+
+        <div>
+          <label style="font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600;">Signature</label>
+          <div class="code-block" id="insp-signature">-</div>
+        </div>
+
+        <div>
+          <label style="font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600;">Docstring</label>
+          <p id="insp-doc" style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.25rem;">-</p>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem;">
+          <button class="btn btn-primary" id="btn-insp-impact" style="flex: 1;">Analyze Impact</button>
+        </div>
+
+        <div style="border-top: 1px solid var(--border-color); padding-top: 0.75rem;">
+          <label style="font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600;">Callers & Callees</label>
+          <div id="insp-relations" style="font-size: 0.85rem; margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.4rem;">
+            <p style="color: var(--text-muted);">Select node to inspect edges</p>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <!-- 3. Symbol Search View -->
+    <section id="search-view" class="view-panel">
+      <div class="search-bar-container">
+        <input type="text" id="main-search-input" class="search-input" placeholder="Search functions, classes, interfaces, or docstrings (e.g. 'Calculator', 'add', 'options')...">
+        <button class="btn btn-primary" id="btn-search-exec">Search</button>
+      </div>
+
+      <div class="type-filter-group">
+        <span class="filter-chip active" data-type="">All Types</span>
+        <span class="filter-chip" data-type="FUNCTION">Functions</span>
+        <span class="filter-chip" data-type="METHOD">Methods</span>
+        <span class="filter-chip" data-type="CLASS">Classes</span>
+        <span class="filter-chip" data-type="INTERFACE">Interfaces</span>
+        <span class="filter-chip" data-type="TYPE">Types</span>
+        <span class="filter-chip" data-type="TEST">Tests</span>
+        <span class="filter-chip" data-type="FILE">Files</span>
+      </div>
+
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th>Symbol Name</th>
+            <th>Type</th>
+            <th>File Location</th>
+            <th>Lines</th>
+            <th>Signature / Snippet</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="search-results-tbody">
+          <tr>
+            <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+              Type a search query above to explore repository symbols.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- 4. Change Impact View -->
+    <section id="impact-view" class="view-panel">
+      <div class="section-card">
+        <div class="section-title">Change Impact Blast-Radius Engine</div>
+        <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.9rem;">
+          Evaluate the upstream blast radius of modifying a symbol or file. Calculates all direct and transitive callers, dependent files, and linked tests.
+        </p>
+        <div style="display: flex; gap: 1rem; align-items: flex-end;">
+          <div style="flex: 1;">
+            <label style="font-size: 0.85rem; color: var(--text-secondary); display: block; margin-bottom: 0.35rem;">Target Symbol Name or File Path:</label>
+            <input type="text" id="impact-target-input" placeholder="e.g. add, Calculator, math_ops.py" style="width: 100%;">
+          </div>
+          <div style="width: 140px;">
+            <label style="font-size: 0.85rem; color: var(--text-secondary); display: block; margin-bottom: 0.35rem;">Max Depth: <span id="impact-depth-val">5</span></label>
+            <input type="range" id="impact-depth-slider" min="1" max="10" value="5" style="width: 100%;">
+          </div>
+          <button class="btn btn-primary" id="btn-run-impact">Calculate Blast Radius</button>
+        </div>
+      </div>
+
+      <div id="impact-results-container" style="display: none;">
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-title">Target Evaluated</div>
+            <div class="metric-value" id="impact-metric-target" style="font-size: 1.25rem;">-</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Affected Symbols</div>
+            <div class="metric-value" id="impact-metric-symbols">0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Affected Files</div>
+            <div class="metric-value" id="impact-metric-files">0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Linked Unit Tests</div>
+            <div class="metric-value" id="impact-metric-tests" style="color: var(--color-test);">0</div>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem;">
+          <div class="section-card">
+            <div class="section-title">Affected Source Files</div>
+            <ul id="impact-files-list" style="list-style: none; font-family: var(--font-mono); font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.4rem;">
+            </ul>
+          </div>
+
+          <div class="section-card">
+            <div class="section-title">Linked Tests Requiring Execution</div>
+            <ul id="impact-tests-list" style="list-style: none; font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.4rem;">
+            </ul>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <div class="section-title">Step-by-Step Propagation Evidence Trace</div>
+          <table class="results-table">
+            <thead>
+              <tr>
+                <th>Consumer Symbol</th>
+                <th>Relationship</th>
+                <th>Source File</th>
+                <th>Line</th>
+                <th>Code Evidence</th>
+              </tr>
+            </thead>
+            <tbody id="impact-evidence-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. MCP Setup View -->
+    <section id="mcp-view" class="view-panel">
+      <div class="section-card">
+        <div class="section-title">Model Context Protocol (MCP) Integration</div>
+        <p style="color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.9rem;">
+          Connect AI coding assistants (Antigravity, Claude Code, Cursor, Windsurf) to ApexGraph to enable deterministic structural code queries without token waste.
+        </p>
+
+        <h4 style="margin: 1rem 0 0.5rem 0; font-size: 0.95rem;">Antigravity MCP Configuration (.agents/mcp_config.json)</h4>
+        <pre class="code-block">{
+  "mcpServers": {
+    "apexgraph": {
+      "command": "python",
+      "args": ["-m", "packages.mcp.server", "--transport", "stdio"],
+      "cwd": "C:/Users/pkumar2/OneDrive - Data Axle/Documents/AI_INIT/RepopeekV3",
+      "env": {
+        "PYTHONPATH": "C:/Users/pkumar2/OneDrive - Data Axle/Documents/AI_INIT/RepopeekV3"
+      }
+    }
+  }
+}</pre>
+
+        <h4 style="margin: 1.5rem 0 0.5rem 0; font-size: 0.95rem;">Claude Code / Desktop Configuration (claude_desktop_config.json)</h4>
+        <pre class="code-block">{
+  "mcpServers": {
+    "apexgraph": {
+      "command": "python",
+      "args": ["-m", "packages.mcp.server", "--transport", "stdio"],
+      "cwd": "C:/Users/pkumar2/OneDrive - Data Axle/Documents/AI_INIT/RepopeekV3"
+    }
+  }
+}</pre>
+      </div>
+
+      <div class="section-card">
+        <div class="section-title">Active MCP Tool Catalog (13 Verified Tools)</div>
+        <table class="results-table">
+          <thead>
+            <tr>
+              <th>Tool Name</th>
+              <th>Description</th>
+              <th>Key Parameters</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>search_code</code></td>
+              <td>Performs structural and lexical search across code symbols and files</td>
+              <td>query, repo_id, node_type, limit</td>
+            </tr>
+            <tr>
+              <td><code>find_symbol</code></td>
+              <td>Locates exact symbol definitions with line numbers and file paths</td>
+              <td>name, repo_id, file_path</td>
+            </tr>
+            <tr>
+              <td><code>get_symbol_details</code></td>
+              <td>Returns full symbol signature, docstring, callers, and callees</td>
+              <td>node_id</td>
+            </tr>
+            <tr>
+              <td><code>get_callers</code></td>
+              <td>Traces all upstream callers and callers of callers</td>
+              <td>node_id, max_depth</td>
+            </tr>
+            <tr>
+              <td><code>get_callees</code></td>
+              <td>Traces all downstream functions/methods invoked by symbol</td>
+              <td>node_id, max_depth</td>
+            </tr>
+            <tr>
+              <td><code>get_dependencies</code></td>
+              <td>Returns imported modules and internal symbol dependencies</td>
+              <td>node_id</td>
+            </tr>
+            <tr>
+              <td><code>analyze_change_impact</code></td>
+              <td>Calculates blast radius: affected symbols, files, and linked tests</td>
+              <td>target_node_or_file, repo_id, max_depth</td>
+            </tr>
+            <tr>
+              <td><code>find_related_tests</code></td>
+              <td>Discovers unit and integration tests covering the target symbol</td>
+              <td>node_id</td>
+            </tr>
+            <tr>
+              <td><code>trace_relationships</code></td>
+              <td>Finds shortest relational path between two symbols or files</td>
+              <td>source_id, target_id, max_depth</td>
+            </tr>
+            <tr>
+              <td><code>get_graph_neighborhood</code></td>
+              <td>Returns immediate N-hop graph neighborhood for visualization</td>
+              <td>node_id, radius, limit</td>
+            </tr>
+            <tr>
+              <td><code>list_workspaces</code></td>
+              <td>Lists all registered workspaces in the platform</td>
+              <td>-</td>
+            </tr>
+            <tr>
+              <td><code>list_repositories</code></td>
+              <td>Lists repositories with language stats and indexing status</td>
+              <td>workspace_id</td>
+            </tr>
+            <tr>
+              <td><code>get_repository_status</code></td>
+              <td>Returns indexing status, last indexed revision, and statistics</td>
+              <td>repo_id</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 6. Architecture View -->
+    <section id="architecture-view" class="view-panel">
+      <div class="section-card">
+        <div class="section-title">ApexGraph Architectural Principles</div>
+        <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+          ApexGraph provides clean-room, production-grade code intelligence inspired by Graphify and REA.
+        </p>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+          <div style="background: var(--bg-surface); padding: 1rem; border-radius: 6px;">
+            <h4 style="color: var(--color-accent); margin-bottom: 0.5rem;">Deterministic AST Indexing</h4>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">
+              Tree-sitter parsers parse Python, TypeScript, and JavaScript into typed AST representations. Code is strictly processed as passive data; repository scripts are never executed.
+            </p>
+          </div>
+          <div style="background: var(--bg-surface); padding: 1rem; border-radius: 6px;">
+            <h4 style="color: var(--color-function); margin-bottom: 0.5rem;">Evidence & Provenance Tracking</h4>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">
+              Every graph edge retains source file path, exact line numbers, and original code snippets. Relationships distinguish confirmed AST definitions (confidence 1.0) from heuristic linkages.
+            </p>
+          </div>
+          <div style="background: var(--bg-surface); padding: 1rem; border-radius: 6px;">
+            <h4 style="color: var(--color-type); margin-bottom: 0.5rem;">Blast Radius Impact Engine</h4>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">
+              Reverse traversal traces dependencies upward from modified symbols, identifying all impacted files and dynamically locating the unit tests that verify them.
+            </p>
+          </div>
+          <div style="background: var(--bg-surface); padding: 1rem; border-radius: 6px;">
+            <h4 style="color: var(--color-danger); margin-bottom: 0.5rem;">Defense-in-Depth Security</h4>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">
+              Strict canonical path validation prevents directory traversal. Remote Git ingestion enforces SSRF protections blocking RFC 1918 and cloud metadata endpoints.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Modal: Register Repository -->
+  <div class="modal-overlay" id="modal-register-repo">
+    <div class="modal-card">
+      <h3 style="margin-bottom: 1rem;">Register Repository</h3>
+      <div class="form-group">
+        <label for="repo-name-input">Repository Display Name:</label>
+        <input type="text" id="repo-name-input" placeholder="e.g. da-assistant, my-service">
+      </div>
+      <div class="form-group">
+        <label for="repo-source-type">Source Ingestion Type:</label>
+        <select id="repo-source-type">
+          <option value="local">Local Directory Path</option>
+          <option value="git">Public Git URL (HTTPS)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="repo-path-input">Source Path / URL:</label>
+        <input type="text" id="repo-path-input" placeholder="C:/path/to/repo or https://github.com/org/repo.git">
+        <small>Paths are validated against traversal vulnerabilities. HTTPS only for remote repos.</small>
+      </div>
+      <div id="repo-modal-error" style="color: var(--color-danger); font-size: 0.85rem; margin-bottom: 1rem; display: none;"></div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
+        <button class="btn" id="btn-cancel-repo">Cancel</button>
+        <button class="btn btn-primary" id="btn-submit-repo">Register & Index</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Create Workspace -->
+  <div class="modal-overlay" id="modal-new-workspace">
+    <div class="modal-card">
+      <h3 style="margin-bottom: 1rem;">Create New Workspace</h3>
+      <div class="form-group">
+        <label for="workspace-name-input">Workspace Name:</label>
+        <input type="text" id="workspace-name-input" placeholder="e.g. Core Services, Production APIs">
+      </div>
+      <div id="workspace-modal-error" style="color: var(--color-danger); font-size: 0.85rem; margin-bottom: 1rem; display: none;"></div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.75rem;">
+        <button class="btn" id="btn-cancel-workspace">Cancel</button>
+        <button class="btn btn-primary" id="btn-submit-workspace">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

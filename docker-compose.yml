@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  apex-db:
+    image: postgres:16-alpine
+    container_name: apexgraph-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: apexgraph
+      POSTGRES_USER: apex
+      POSTGRES_PASSWORD: apex_secure_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - apex-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apex -d apexgraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  apex-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apexgraph-api
+    restart: unless-stopped
+    depends_on:
+      apex-db:
+        condition: service_healthy
+    environment:
+      APEX_ENV: production
+      APEX_HOST: 0.0.0.0
+      APEX_PORT: 8000
+      DATABASE_URL: postgresql+psycopg2://apex:apex_secure_password@apex-db:5432/apexgraph
+      APEX_DATA_DIR: /app/data
+      MAX_FILE_SIZE_BYTES: 2097152
+      MAX_REPO_SIZE_BYTES: 524288000
+    ports:
+      - "8000:8000"
+    volumes:
+      - apex-app-data:/app/data
+
+volumes:
+  apex-db-data:
+  apex-app-data:
