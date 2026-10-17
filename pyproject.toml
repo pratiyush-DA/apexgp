@@ -31,6 +31,12 @@ dev = [
     "playwright>=1.49.0",
 ]
 
+[project.scripts]
+apexgp = "packages.mcp.server:main"
+apexgraph = "packages.mcp.server:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = ["."]
+

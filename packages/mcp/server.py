@@ -10,7 +10,13 @@ import asyncio
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Ensure package root is in sys.path when executed directly as a script
+_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from mcp.server.mcpserver import MCPServer
 from packages.core.database import get_db_session, init_db
