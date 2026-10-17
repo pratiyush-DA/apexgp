@@ -40,6 +40,19 @@ IGNORE_DIRS = {
 
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_BYTES", 2 * 1024 * 1024))  # 2MB
 
+LANGUAGE_FAMILIES: Dict[str, str] = {
+    "python": "python",
+    "typescript": "js_ts",
+    "javascript": "js_ts",
+}
+
+
+def are_languages_call_compatible(lang_a: str, lang_b: str) -> bool:
+    """Checks if two languages belong to the same execution runtime family for in-process AST calls."""
+    fam_a = LANGUAGE_FAMILIES.get(lang_a, lang_a)
+    fam_b = LANGUAGE_FAMILIES.get(lang_b, lang_b)
+    return fam_a == fam_b
+
 
 class RepositoryIndexer:
     def __init__(self, db_session: Session):
@@ -183,6 +196,13 @@ class RepositoryIndexer:
                 confidence: float,
                 evidence: str,
             ):
+                # Ensure no dangling internal node edges
+                if not target_id.startswith("ext:") and target_id not in nodes_by_id:
+                    logger.warning(
+                        f"Skipping edge with missing target internal node: {target_id}"
+                    )
+                    return
+
                 edge_key = f"{source_id}:{edge_type}:{target_id}"
                 if edge_key not in edge_keys_seen:
                     edge_keys_seen.add(edge_key)
@@ -242,6 +262,7 @@ class RepositoryIndexer:
                         base_file=rel_path,
                         import_path=imp.module_path,
                         known_files=set(all_parse_results.keys()),
+                        base_language=parse_res.language,
                     )
 
                     if target_file_path:
@@ -257,10 +278,16 @@ class RepositoryIndexer:
                         )
 
                         # Link imported specific symbols
+                        target_parse_res = all_parse_results.get(target_file_path)
+                        target_runtime_prefix = (
+                            "py"
+                            if target_parse_res and target_parse_res.language == "python"
+                            else ("ts" if target_parse_res and target_parse_res.language == "typescript" else "js")
+                        )
                         for sym in imp.imported_symbols:
                             if sym == "*":
                                 continue
-                            target_sym_id = f"{repository_id}:{runtime_prefix}:{target_file_path}:{sym}"
+                            target_sym_id = f"{repository_id}:{target_runtime_prefix}:{target_file_path}:{sym}"
                             if target_sym_id in nodes_by_id:
                                 add_edge(
                                     source_id=file_id,
@@ -293,9 +320,20 @@ class RepositoryIndexer:
                         if call.caller_name != "<module>"
                         else f"{repository_id}:file:{rel_path}"
                     )
+                    if caller_id not in nodes_by_id:
+                        caller_id = f"{repository_id}:file:{rel_path}"
 
                     # Look for matching callee in symbol table
-                    callee_candidates = symbol_table.get(call.callee_name, [])
+                    raw_candidates = symbol_table.get(call.callee_name, [])
+                    if not raw_candidates:
+                        continue
+
+                    # Filter candidates to only those compatible with caller's language family
+                    callee_candidates = [
+                        cand
+                        for cand in raw_candidates
+                        if are_languages_call_compatible(parse_res.language, cand.language)
+                    ]
                     if not callee_candidates:
                         continue
 
@@ -384,37 +422,69 @@ class RepositoryIndexer:
             raise
 
     def _resolve_import_path(
-        self, base_file: str, import_path: str, known_files: Set[str]
+        self,
+        base_file: str,
+        import_path: str,
+        known_files: Set[str],
+        base_language: Optional[str] = None,
     ) -> Optional[str]:
         """Resolves relative and package imports to actual files in the repository."""
         base_dir = os.path.dirname(base_file)
 
+        # Detect language family if not provided
+        if not base_language:
+            ext = os.path.splitext(base_file)[1].lower()
+            if ext == ".py":
+                base_language = "python"
+            elif ext in (".ts", ".tsx"):
+                base_language = "typescript"
+            elif ext in (".js", ".jsx", ".mjs", ".cjs"):
+                base_language = "javascript"
+
+        is_python = base_language == "python"
+
         # Handle relative imports: ./util, ../math
         if import_path.startswith("."):
             joined = os.path.normpath(os.path.join(base_dir, import_path)).replace("\\", "/")
-            candidates = [
-                joined,
-                f"{joined}.py",
-                f"{joined}.ts",
-                f"{joined}.tsx",
-                f"{joined}.js",
-                f"{joined}.jsx",
-                f"{joined}/__init__.py",
-                f"{joined}/index.ts",
-                f"{joined}/index.js",
-            ]
+            if is_python:
+                candidates = [
+                    joined,
+                    f"{joined}.py",
+                    f"{joined}/__init__.py",
+                ]
+            else:
+                candidates = [
+                    joined,
+                    f"{joined}.ts",
+                    f"{joined}.tsx",
+                    f"{joined}.js",
+                    f"{joined}.jsx",
+                    f"{joined}/index.ts",
+                    f"{joined}/index.tsx",
+                    f"{joined}/index.js",
+                    f"{joined}/index.jsx",
+                ]
             for cand in candidates:
                 if cand in known_files:
                     return cand
 
         # Handle Python module dot notation (e.g. core.math -> core/math.py)
-        dot_as_path = import_path.replace(".", "/")
-        candidates = [
-            f"{dot_as_path}.py",
-            f"{dot_as_path}/__init__.py",
-        ]
-        for cand in candidates:
-            if cand in known_files:
-                return cand
+        # Strictly limited to Python files so TS/JS non-relative imports (e.g. express)
+        # do not match unrelated Python files or directories.
+        if is_python:
+            dot_as_path = import_path.replace(".", "/")
+            candidates = [
+                f"{dot_as_path}.py",
+                f"{dot_as_path}/__init__.py",
+            ]
+            if base_dir and base_dir != ".":
+                joined_rel = os.path.normpath(os.path.join(base_dir, dot_as_path)).replace("\\", "/")
+                candidates.extend([
+                    f"{joined_rel}.py",
+                    f"{joined_rel}/__init__.py",
+                ])
+            for cand in candidates:
+                if cand in known_files:
+                    return cand
 
         return None
