@@ -44,3 +44,8 @@ blob-report/
 # OS
 .DS_Store
 Thumbs.db
+
+# Evaluation, Testing, and Local Outputs
+output/
+testing/
+benchmarks/
