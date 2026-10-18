@@ -548,3 +548,139 @@ class GraphQueryEngine:
                 for e in edges_list
             ],
         }
+
+    def detect_import_cycles(self, repo_id: str) -> List[List[str]]:
+        """Detects circular import dependencies across internal files in a repository.
+
+        Uses Tarjan's strongly connected components algorithm to find groups of files
+        involved in mutual import loops.
+
+        Output semantics:
+            This method returns cyclic strongly connected components (SCCs), not every
+            individual elementary cycle path. A component is returned if it contains
+            more than one file (multi-node cycle) or exactly one file with an explicit
+            self-loop (file importing itself). Each component is a sorted list of
+            repository-relative file paths, and the outer list of components is sorted
+            deterministically.
+
+        Args:
+            repo_id: The UUID of the repository to diagnose.
+
+        Returns:
+            A deterministically sorted list of cyclic components, where each component
+            is a sorted list of relative file paths. Returns [] for an acyclic repository.
+        """
+        # 1. Fetch all internal IMPORTS edges for this repository
+        edges = (
+            self.db.query(GraphEdgeModel.source_id, GraphEdgeModel.target_id)
+            .filter(
+                GraphEdgeModel.repository_id == repo_id,
+                GraphEdgeModel.edge_type == "IMPORTS",
+            )
+            .all()
+        )
+
+        if not edges:
+            return []
+
+        # 2. Build mapping of internal file node IDs to relative file paths
+        file_nodes = (
+            self.db.query(GraphNodeModel.id, GraphNodeModel.file_path)
+            .filter(
+                GraphNodeModel.repository_id == repo_id,
+                GraphNodeModel.node_type == "FILE",
+            )
+            .all()
+        )
+        node_id_to_rel_path: Dict[str, str] = {fn.id: fn.file_path for fn in file_nodes}
+
+        prefix = f"{repo_id}:file:"
+
+        def resolve_file_path(node_id: str) -> Optional[str]:
+            if not node_id or node_id.startswith("ext:"):
+                return None
+            if node_id in node_id_to_rel_path:
+                return node_id_to_rel_path[node_id]
+            if node_id.startswith(prefix):
+                return node_id[len(prefix):]
+            return None
+
+        # 3. Build adjacency list with deduplicated edges
+        adj: Dict[str, Set[str]] = {}
+        all_files: Set[str] = set()
+
+        for src_id, tgt_id in edges:
+            src_file = resolve_file_path(src_id)
+            tgt_file = resolve_file_path(tgt_id)
+
+            # Both endpoints must resolve to internal repository files
+            if src_file is None or tgt_file is None:
+                continue
+
+            all_files.add(src_file)
+            all_files.add(tgt_file)
+
+            if src_file not in adj:
+                adj[src_file] = set()
+            adj[src_file].add(tgt_file)
+
+        if not all_files:
+            return []
+
+        # 4. Tarjan's strongly connected components algorithm (iterative DFS)
+        index = 0
+        indices: Dict[str, int] = {}
+        lowlink: Dict[str, int] = {}
+        on_stack: Dict[str, bool] = {}
+        stack: List[str] = []
+        cyclic_components: List[List[str]] = []
+
+        for root in sorted(all_files):
+            if root in indices:
+                continue
+
+            dfs_stack: List[Tuple[str, Any]] = []
+
+            indices[root] = index
+            lowlink[root] = index
+            index += 1
+            stack.append(root)
+            on_stack[root] = True
+            dfs_stack.append((root, iter(sorted(adj.get(root, set())))))
+
+            while dfs_stack:
+                u, neighbors = dfs_stack[-1]
+                try:
+                    v = next(neighbors)
+                    if v not in indices:
+                        indices[v] = index
+                        lowlink[v] = index
+                        index += 1
+                        stack.append(v)
+                        on_stack[v] = True
+                        dfs_stack.append((v, iter(sorted(adj.get(v, set())))))
+                    elif on_stack.get(v, False):
+                        lowlink[u] = min(lowlink[u], indices[v])
+                except StopIteration:
+                    dfs_stack.pop()
+                    if dfs_stack:
+                        parent = dfs_stack[-1][0]
+                        lowlink[parent] = min(lowlink[parent], lowlink[u])
+
+                    if lowlink[u] == indices[u]:
+                        scc: List[str] = []
+                        while True:
+                            w = stack.pop()
+                            on_stack[w] = False
+                            scc.append(w)
+                            if w == u:
+                                break
+                        # Component is cyclic if > 1 node or 1 node with an explicit self-loop
+                        is_cyclic = len(scc) > 1 or (len(scc) == 1 and scc[0] in adj.get(scc[0], set()))
+                        if is_cyclic:
+                            cyclic_components.append(sorted(scc))
+
+        # 5. Deterministic sorting: components sorted by first file path, then length
+        cyclic_components.sort(key=lambda c: (c[0], len(c)))
+        return cyclic_components
+

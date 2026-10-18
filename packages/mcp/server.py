@@ -291,6 +291,35 @@ def get_graph_neighborhood(node_id: str, radius: int = 1, limit: int = 50) -> st
         return json.dumps(neighborhood, indent=2)
 
 
+@mcp_server.tool()
+def detect_import_cycles(repo_id: str) -> str:
+    """Detects cyclic import dependencies across internal files in a repository.
+    
+    Returns cyclic strongly connected components (groups of files where each file
+    directly or transitively depends on all others in the group, or self-loops).
+    
+    Args:
+        repo_id: Repository UUID.
+    """
+    with get_db_session() as db:
+        repo = db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            return json.dumps({"error": f"Repository '{repo_id}' not found"})
+        engine = GraphQueryEngine(db)
+        try:
+            cycles = engine.detect_import_cycles(repo_id=repo_id)
+            return json.dumps(
+                {
+                    "repository_id": repo_id,
+                    "cyclic_components": cycles,
+                    "total_cyclic_components": len(cycles),
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+
 def main():
     parser = argparse.ArgumentParser(description="ApexGraph MCP Server")
     parser.add_argument(
