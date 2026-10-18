@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
 
 from mcp.server.mcpserver import MCPServer
 from packages.core.database import get_db_session, init_db
+from packages.core.indexer import RepositoryIndexer
 from packages.core.models import RepositoryModel, WorkspaceModel
 from packages.core.query_engine import GraphQueryEngine
 
@@ -359,6 +360,22 @@ def god_nodes(
             "god_nodes": [r.model_dump() for r in results],
         }
         return json.dumps(payload, indent=2, default=str)
+
+
+@mcp_server.tool()
+def sync_repository(repo_id: str) -> str:
+    """Incrementally synchronizes a repository with disk, updating modified, added, or deleted files.
+    
+    Args:
+        repo_id: The UUID of the repository to synchronize.
+    """
+    with get_db_session() as db:
+        repo = db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            return json.dumps({"error": f"Repository '{repo_id}' not found"})
+        indexer = RepositoryIndexer(db)
+        sync_result = indexer.sync_repository(repo_id)
+        return json.dumps(sync_result, indent=2, default=str)
 
 
 def main():

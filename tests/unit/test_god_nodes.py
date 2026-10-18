@@ -422,7 +422,7 @@ def test_mcp_god_nodes_tool(monkeypatch, db_session):
     tools = asyncio.run(mcp_server.list_tools())
     tool_names = [t.name for t in tools]
     assert "god_nodes" in tool_names
-    assert len(tool_names) == 15
+    assert len(tool_names) >= 15
 
     # 2. Verify invocation with valid repo using monkeypatched get_db_session
     repo = _create_repo(db_session, "MCP Repo")

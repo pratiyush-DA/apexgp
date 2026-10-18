@@ -8,10 +8,12 @@ import os
 import re
 import json
 import time
+import hashlib
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from packages.core.models import (
     GraphEdgeModel,
@@ -91,6 +93,8 @@ class RepositoryIndexer:
             all_parse_results: Dict[str, ParseResult] = {}
             line_counts: Dict[str, int] = {}
             file_sizes: Dict[str, int] = {}
+            file_mtimes: Dict[str, float] = {}
+            file_hashes: Dict[str, str] = {}
             language_counts: Dict[str, int] = {}
             syntax_warnings: List[str] = []
 
@@ -112,9 +116,11 @@ class RepositoryIndexer:
                             continue
 
                         file_sizes[rel_path] = sz
+                        file_mtimes[rel_path] = os.path.getmtime(full_path)
                         with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                             content = f.read()
 
+                        file_hashes[rel_path] = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
                         lines = content.splitlines()
                         line_counts[rel_path] = len(lines)
 
@@ -153,7 +159,12 @@ class RepositoryIndexer:
                     language=parse_res.language,
                     signature=f"file {os.path.basename(rel_path)}",
                     docstring="",
-                    node_metadata={"size_bytes": file_sizes.get(rel_path, 0), "lines": line_counts.get(rel_path, 0)},
+                    node_metadata={
+                        "size_bytes": file_sizes.get(rel_path, 0),
+                        "lines": line_counts.get(rel_path, 0),
+                        "content_hash": file_hashes.get(rel_path, ""),
+                        "mtime": file_mtimes.get(rel_path, 0.0),
+                    },
                 )
                 nodes_to_insert.append(file_node)
                 nodes_by_id[file_id] = file_node
@@ -632,9 +643,10 @@ class RepositoryIndexer:
         current_file: str,
         symbol_name: str,
         all_parse_results: Dict[str, ParseResult],
-        nodes_by_id: Dict[str, GraphNodeModel],
+        nodes_by_id: Optional[Dict[str, GraphNodeModel]],
         repository_id: str,
         visited_files: Optional[Set[str]] = None,
+        repo_root: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
         """Follows re-export chains to locate the defining file and symbol name."""
         if visited_files is None:
@@ -645,12 +657,27 @@ class RepositoryIndexer:
         visited_files.add(current_file)
 
         parse_res = all_parse_results.get(current_file)
+        if not parse_res and repo_root:
+            full_p = os.path.join(repo_root, current_file)
+            if os.path.exists(full_p) and is_supported_file(current_file):
+                try:
+                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        c = f.read()
+                    parse_res = parse_source_file(current_file, c)
+                    if parse_res:
+                        all_parse_results[current_file] = parse_res
+                except Exception:
+                    parse_res = None
+
         if not parse_res:
             return None
 
         runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
         direct_node_id = f"{repository_id}:{runtime_prefix}:{current_file}:{symbol_name}"
-        if direct_node_id in nodes_by_id:
+        if nodes_by_id and direct_node_id in nodes_by_id:
+            return (current_file, symbol_name)
+        db_sym = self.db.query(GraphNodeModel.id).filter_by(id=direct_node_id, repository_id=repository_id).first()
+        if db_sym:
             return (current_file, symbol_name)
 
         # Check re-exports in current_file
@@ -662,7 +689,7 @@ class RepositoryIndexer:
                 known_files=known_files,
                 base_language=parse_res.language,
             )
-            if not target_path or target_path not in all_parse_results:
+            if not target_path:
                 continue
 
             # Case A: Named re-export
@@ -675,6 +702,7 @@ class RepositoryIndexer:
                     nodes_by_id=nodes_by_id,
                     repository_id=repository_id,
                     visited_files=visited_files,
+                    repo_root=repo_root,
                 )
                 if found:
                     return found
@@ -688,6 +716,7 @@ class RepositoryIndexer:
                     nodes_by_id=nodes_by_id,
                     repository_id=repository_id,
                     visited_files=visited_files,
+                    repo_root=repo_root,
                 )
                 if found:
                     return found
@@ -827,3 +856,938 @@ class RepositoryIndexer:
                     return cand
 
         return None
+
+    def _purge_file_nodes_and_edges(self, repository_id: str, rel_path: str) -> Set[str]:
+        """Purges all nodes and edges associated with a file, including incoming dangling edges."""
+        existing_nodes = (
+            self.db.query(GraphNodeModel)
+            .filter(
+                GraphNodeModel.repository_id == repository_id,
+                GraphNodeModel.file_path == rel_path,
+            )
+            .all()
+        )
+        if not existing_nodes:
+            return set()
+
+        node_ids = {n.id for n in existing_nodes}
+        node_ids_list = list(node_ids)
+
+        # 1. Purge incoming edges targeting any of these nodes (prevents dangling edges)
+        # Chunk into slices of 500 for SQLite parameter limits
+        for i in range(0, len(node_ids_list), 500):
+            chunk = node_ids_list[i : i + 500]
+            self.db.query(GraphEdgeModel).filter(
+                GraphEdgeModel.repository_id == repository_id,
+                GraphEdgeModel.target_id.in_(chunk),
+            ).delete(synchronize_session=False)
+
+        # 2. Purge outgoing edges originating from this file
+        self.db.query(GraphEdgeModel).filter(
+            GraphEdgeModel.repository_id == repository_id,
+            GraphEdgeModel.file_path == rel_path,
+        ).delete(synchronize_session=False)
+
+        # 3. Purge nodes themselves
+        self.db.query(GraphNodeModel).filter(
+            GraphNodeModel.repository_id == repository_id,
+            GraphNodeModel.file_path == rel_path,
+        ).delete(synchronize_session=False)
+
+        return node_ids
+
+    def _recompute_repository_stats(self, repository_id: str, repo: RepositoryModel) -> Dict[str, Any]:
+        """Recomputes aggregate repository statistics directly from the database graph."""
+        total_files = (
+            self.db.query(func.count(GraphNodeModel.id))
+            .filter(
+                GraphNodeModel.repository_id == repository_id,
+                GraphNodeModel.node_type == "FILE",
+            )
+            .scalar()
+            or 0
+        )
+
+        total_nodes = (
+            self.db.query(func.count(GraphNodeModel.id))
+            .filter(GraphNodeModel.repository_id == repository_id)
+            .scalar()
+            or 0
+        )
+
+        total_edges = (
+            self.db.query(func.count(GraphEdgeModel.id))
+            .filter(GraphEdgeModel.repository_id == repository_id)
+            .scalar()
+            or 0
+        )
+
+        node_type_rows = (
+            self.db.query(GraphNodeModel.node_type, func.count(GraphNodeModel.id))
+            .filter(GraphNodeModel.repository_id == repository_id)
+            .group_by(GraphNodeModel.node_type)
+            .all()
+        )
+        node_types = {r[0]: r[1] for r in node_type_rows}
+
+        lang_rows = (
+            self.db.query(GraphNodeModel.language, func.count(GraphNodeModel.id))
+            .filter(
+                GraphNodeModel.repository_id == repository_id,
+                GraphNodeModel.node_type == "FILE",
+            )
+            .group_by(GraphNodeModel.language)
+            .all()
+        )
+        languages = {r[0]: r[1] for r in lang_rows}
+
+        file_nodes = (
+            self.db.query(GraphNodeModel.node_metadata)
+            .filter(
+                GraphNodeModel.repository_id == repository_id,
+                GraphNodeModel.node_type == "FILE",
+            )
+            .all()
+        )
+        total_lines = 0
+        for fn in file_nodes:
+            meta = fn[0] if fn and isinstance(fn[0], dict) else {}
+            total_lines += meta.get("lines", 0)
+
+        prev_stats = repo.stats if isinstance(repo.stats, dict) else {}
+        stats = {
+            "total_files": total_files,
+            "total_lines": total_lines,
+            "languages": languages,
+            "node_types": node_types,
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "duration_seconds": prev_stats.get("duration_seconds", 0.0),
+            "warnings": prev_stats.get("warnings", []),
+        }
+        repo.stats = stats
+        return stats
+
+    def _construct_edges_for_file(
+        self,
+        repository_id: str,
+        rel_path: str,
+        parse_res: ParseResult,
+        known_files: Set[str],
+        repo_root: Optional[str] = None,
+    ) -> List[GraphEdgeModel]:
+        """Constructs all outgoing edges for a single parsed file against the repository graph."""
+        file_id = f"{repository_id}:file:{rel_path}"
+        runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+
+        local_nodes = (
+            self.db.query(GraphNodeModel)
+            .filter(
+                GraphNodeModel.repository_id == repository_id,
+                GraphNodeModel.file_path == rel_path,
+            )
+            .all()
+        )
+        local_nodes_by_id = {n.id: n for n in local_nodes}
+        local_nodes_by_name: Dict[str, List[GraphNodeModel]] = {}
+        for n in local_nodes:
+            if n.node_type != "FILE":
+                local_nodes_by_name.setdefault(n.name, []).append(n)
+
+        file_node = local_nodes_by_id.get(file_id)
+        file_name = file_node.name if file_node else os.path.basename(rel_path)
+
+        edges_to_insert: List[GraphEdgeModel] = []
+        edge_keys_seen: Set[str] = set()
+
+        def add_edge(
+            source_id: str,
+            target_id: str,
+            edge_type: str,
+            line_no: int,
+            confidence: float,
+            evidence: str,
+        ):
+            edge_key = f"{source_id}:{edge_type}:{target_id}"
+            if edge_key not in edge_keys_seen:
+                edge_keys_seen.add(edge_key)
+                edges_to_insert.append(
+                    GraphEdgeModel(
+                        id=edge_key,
+                        repository_id=repository_id,
+                        source_id=source_id,
+                        target_id=target_id,
+                        edge_type=edge_type,
+                        confidence=confidence,
+                        file_path=rel_path,
+                        line_number=line_no,
+                        evidence=evidence[:500],
+                    )
+                )
+
+        # 1. DEFINES and CONTAINS edges
+        for ex_node in parse_res.nodes:
+            node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
+            add_edge(
+                source_id=file_id,
+                target_id=node_id,
+                edge_type="DEFINES",
+                line_no=ex_node.start_line,
+                confidence=1.0,
+                evidence=f"{file_name} defines {ex_node.name}",
+            )
+
+            enclosing = ex_node.metadata.get("enclosing")
+            if enclosing:
+                parent_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{enclosing}"
+                add_edge(
+                    source_id=parent_id,
+                    target_id=node_id,
+                    edge_type="CONTAINS",
+                    line_no=ex_node.start_line,
+                    confidence=1.0,
+                    evidence=f"{enclosing} contains {ex_node.name}",
+                )
+
+        # 2. IMPORTS and REFERENCES edges
+        file_imported_symbols: Dict[str, GraphNodeModel] = {}
+        target_nodes_cache: Dict[str, Dict[str, GraphNodeModel]] = {}
+
+        def _get_target_file_nodes(tgt_f: str) -> Dict[str, GraphNodeModel]:
+            if tgt_f not in target_nodes_cache:
+                t_nodes = (
+                    self.db.query(GraphNodeModel)
+                    .filter(
+                        GraphNodeModel.repository_id == repository_id,
+                        GraphNodeModel.file_path == tgt_f,
+                    )
+                    .all()
+                )
+                target_nodes_cache[tgt_f] = {n.name: n for n in t_nodes if n.node_type != "FILE"}
+            return target_nodes_cache[tgt_f]
+
+        for imp in parse_res.imports:
+            target_file_path = self._resolve_import_path(
+                base_file=rel_path,
+                import_path=imp.module_path,
+                known_files=known_files,
+                base_language=parse_res.language,
+            )
+            if target_file_path:
+                target_file_id = f"{repository_id}:file:{target_file_path}"
+                add_edge(
+                    source_id=file_id,
+                    target_id=target_file_id,
+                    edge_type="IMPORTS",
+                    line_no=imp.line_number,
+                    confidence=1.0,
+                    evidence=imp.raw_statement,
+                )
+
+                t_syms = _get_target_file_nodes(target_file_path)
+                for sym in imp.imported_symbols:
+                    if sym == "*":
+                        continue
+                    if sym in t_syms:
+                        tgt_node = t_syms[sym]
+                        file_imported_symbols[sym] = tgt_node
+                        if imp.alias:
+                            file_imported_symbols[imp.alias] = tgt_node
+                        add_edge(
+                            source_id=file_id,
+                            target_id=tgt_node.id,
+                            edge_type="REFERENCES",
+                            line_no=imp.line_number,
+                            confidence=1.0,
+                            evidence=f"import {sym} from {imp.module_path}",
+                        )
+                    else:
+                        resolved_origin = self._resolve_symbol_origin(
+                            current_file=target_file_path,
+                            symbol_name=sym,
+                            all_parse_results={rel_path: parse_res},
+                            nodes_by_id=None,
+                            repository_id=repository_id,
+                            repo_root=repo_root,
+                        )
+                        if resolved_origin:
+                            origin_file, origin_sym = resolved_origin
+                            o_syms = _get_target_file_nodes(origin_file)
+                            if origin_sym in o_syms:
+                                origin_node = o_syms[origin_sym]
+                                file_imported_symbols[sym] = origin_node
+                                if imp.alias:
+                                    file_imported_symbols[imp.alias] = origin_node
+                                add_edge(
+                                    source_id=file_id,
+                                    target_id=origin_node.id,
+                                    edge_type="REFERENCES",
+                                    line_no=imp.line_number,
+                                    confidence=1.0,
+                                    evidence=f"import {sym} from {imp.module_path} (re-exported from {origin_file})",
+                                )
+            else:
+                external_id = f"ext:{runtime_prefix}:{imp.module_path}"
+                add_edge(
+                    source_id=file_id,
+                    target_id=external_id,
+                    edge_type="IMPORTS",
+                    line_no=imp.line_number,
+                    confidence=1.0,
+                    evidence=imp.raw_statement,
+                )
+
+        for re_exp in parse_res.re_exports:
+            target_file_path = self._resolve_import_path(
+                base_file=rel_path,
+                import_path=re_exp.module_path,
+                known_files=known_files,
+                base_language=parse_res.language,
+            )
+            if target_file_path:
+                target_file_id = f"{repository_id}:file:{target_file_path}"
+                add_edge(
+                    source_id=file_id,
+                    target_id=target_file_id,
+                    edge_type="IMPORTS",
+                    line_no=re_exp.line_number,
+                    confidence=1.0,
+                    evidence=re_exp.raw_statement,
+                )
+                t_syms = _get_target_file_nodes(target_file_path)
+                for exp_alias, src_name in re_exp.exported_symbols.items():
+                    if src_name in t_syms:
+                        tgt_node = t_syms[src_name]
+                        add_edge(
+                            source_id=file_id,
+                            target_id=tgt_node.id,
+                            edge_type="REFERENCES",
+                            line_no=re_exp.line_number,
+                            confidence=1.0,
+                            evidence=f"re-export {exp_alias} from {re_exp.module_path}",
+                        )
+            else:
+                external_id = f"ext:{runtime_prefix}:{re_exp.module_path}"
+                add_edge(
+                    source_id=file_id,
+                    target_id=external_id,
+                    edge_type="IMPORTS",
+                    line_no=re_exp.line_number,
+                    confidence=1.0,
+                    evidence=re_exp.raw_statement,
+                )
+
+        # 3. Precompute reachable import closure for rel_path
+        reachable_imports: Set[str] = set()
+        queue: List[str] = [rel_path]
+        visited: Set[str] = {rel_path}
+        file_prefix = f"{repository_id}:file:"
+
+        while queue:
+            curr_file = queue.pop(0)
+            if curr_file == rel_path:
+                deps = [imp.module_path for imp in parse_res.imports] + [r.module_path for r in parse_res.re_exports]
+                for mod_p in deps:
+                    t_path = self._resolve_import_path(
+                        base_file=curr_file,
+                        import_path=mod_p,
+                        known_files=known_files,
+                        base_language=parse_res.language,
+                    )
+                    if t_path and t_path not in visited:
+                        visited.add(t_path)
+                        reachable_imports.add(t_path)
+                        queue.append(t_path)
+            else:
+                imp_edge_rows = (
+                    self.db.query(GraphEdgeModel.target_id)
+                    .filter(
+                        GraphEdgeModel.repository_id == repository_id,
+                        GraphEdgeModel.source_id == f"{file_prefix}{curr_file}",
+                        GraphEdgeModel.edge_type == "IMPORTS",
+                    )
+                    .all()
+                )
+                for row in imp_edge_rows:
+                    tgt = row[0]
+                    if tgt.startswith(file_prefix):
+                        dep_f = tgt[len(file_prefix):]
+                        if dep_f not in visited:
+                            visited.add(dep_f)
+                            reachable_imports.add(dep_f)
+                            queue.append(dep_f)
+
+        # 4. CALLS and TESTS edges
+        for call in parse_res.calls:
+            caller_id = (
+                f"{repository_id}:{runtime_prefix}:{rel_path}:{call.caller_name}"
+                if call.caller_name != "<module>"
+                else file_id
+            )
+            if caller_id not in local_nodes_by_id:
+                caller_id = file_id
+
+            target_candidate = None
+            if call.callee_name in file_imported_symbols:
+                target_candidate = file_imported_symbols[call.callee_name]
+            elif call.callee_name in local_nodes_by_name:
+                target_candidate = local_nodes_by_name[call.callee_name][0]
+            else:
+                raw_cands = (
+                    self.db.query(GraphNodeModel)
+                    .filter(
+                        GraphNodeModel.repository_id == repository_id,
+                        GraphNodeModel.name == call.callee_name,
+                        GraphNodeModel.node_type != "FILE",
+                    )
+                    .all()
+                )
+                callee_candidates = [
+                    cand for cand in raw_cands
+                    if are_languages_call_compatible(parse_res.language, cand.language)
+                ]
+                if callee_candidates:
+                    for cand in callee_candidates:
+                        if cand.file_path in reachable_imports:
+                            target_candidate = cand
+                            break
+                    if not target_candidate and len(callee_candidates) == 1:
+                        target_candidate = callee_candidates[0]
+
+            if target_candidate:
+                conf = 1.0 if target_candidate.file_path == rel_path else 0.85
+                add_edge(
+                    source_id=caller_id,
+                    target_id=target_candidate.id,
+                    edge_type="CALLS",
+                    line_no=call.line_number,
+                    confidence=conf,
+                    evidence=call.raw_call,
+                )
+
+                caller_node = local_nodes_by_id.get(caller_id) or self.db.query(GraphNodeModel).filter_by(id=caller_id, repository_id=repository_id).first()
+                if caller_node and caller_node.node_type == "TEST":
+                    add_edge(
+                        source_id=caller_id,
+                        target_id=target_candidate.id,
+                        edge_type="TESTS",
+                        line_no=call.line_number,
+                        confidence=0.95,
+                        evidence=f"Test invokes {target_candidate.name}",
+                    )
+
+        # 5. Decorator REFERENCES edges (Python)
+        if parse_res.language == "python":
+            for ex_node in parse_res.nodes:
+                dec_names = ex_node.metadata.get("decorator_names", [])
+                if not dec_names:
+                    continue
+                source_node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
+                for d_name in dec_names:
+                    simple_name = d_name.split(".")[-1]
+                    candidates = (
+                        self.db.query(GraphNodeModel)
+                        .filter(
+                            GraphNodeModel.repository_id == repository_id,
+                            GraphNodeModel.name == simple_name,
+                            GraphNodeModel.language == "python",
+                            GraphNodeModel.node_type != "FILE",
+                        )
+                        .all()
+                    )
+                    matching_cand = None
+                    for c in candidates:
+                        if c.file_path == rel_path or c.file_path in reachable_imports:
+                            matching_cand = c
+                            break
+                    if not matching_cand and len(candidates) == 1:
+                        matching_cand = candidates[0]
+
+                    if matching_cand:
+                        add_edge(
+                            source_id=source_node_id,
+                            target_id=matching_cand.id,
+                            edge_type="REFERENCES",
+                            line_no=ex_node.start_line,
+                            confidence=1.0,
+                            evidence=f"Decorated by @{d_name}",
+                        )
+
+        return edges_to_insert
+
+    def _refresh_importers_edges(
+        self,
+        repository_id: str,
+        repo_root: str,
+        direct_importers: Set[str],
+        known_files: Optional[Set[str]] = None,
+    ):
+        """Rebuilds outgoing edges for files that directly import modified/deleted files."""
+        if not direct_importers:
+            return
+
+        if known_files is None:
+            known_files = {
+                r[0]
+                for r in self.db.query(GraphNodeModel.file_path)
+                .filter(
+                    GraphNodeModel.repository_id == repository_id,
+                    GraphNodeModel.node_type == "FILE",
+                )
+                .all()
+            }
+
+        for imp_path in direct_importers:
+            imp_full_path = os.path.join(repo_root, imp_path)
+            if not os.path.exists(imp_full_path) or not is_supported_file(imp_path):
+                continue
+
+            try:
+                with open(imp_full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    imp_content = f.read()
+                imp_parse_res = parse_source_file(imp_path, imp_content)
+                if not imp_parse_res:
+                    continue
+
+                self.db.query(GraphEdgeModel).filter(
+                    GraphEdgeModel.repository_id == repository_id,
+                    GraphEdgeModel.file_path == imp_path,
+                ).delete(synchronize_session=False)
+
+                new_edges = self._construct_edges_for_file(
+                    repository_id=repository_id,
+                    rel_path=imp_path,
+                    parse_res=imp_parse_res,
+                    known_files=known_files,
+                    repo_root=repo_root,
+                )
+                if new_edges:
+                    self.db.bulk_save_objects(new_edges)
+                    self.db.flush()
+            except Exception as err:
+                logger.warning(f"Could not refresh edges for importer {imp_path}: {err}")
+
+    def update_file(self, repository_id: str, rel_path: str) -> bool:
+        """Incrementally updates or removes a single file in the repository index.
+        
+        Args:
+            repository_id: The UUID of the repository.
+            rel_path: Relative path of the file to update.
+            
+        Returns:
+            bool: True if updated or purged successfully, False otherwise.
+        """
+        repo = self.db.query(RepositoryModel).filter_by(id=repository_id).first()
+        if not repo:
+            raise ValueError(f"Repository {repository_id} not found")
+
+        repo_root = os.path.realpath(repo.source_path)
+        rel_path = rel_path.replace("\\", "/")
+        full_path = os.path.join(repo_root, rel_path)
+
+        if not self.tsconfig_paths and os.path.exists(repo_root):
+            self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+
+        # Pre-query direct importers
+        importer_rows = (
+            self.db.query(GraphEdgeModel.file_path)
+            .filter(
+                GraphEdgeModel.repository_id == repository_id,
+                GraphEdgeModel.target_id == f"{repository_id}:file:{rel_path}",
+                GraphEdgeModel.edge_type == "IMPORTS",
+            )
+            .all()
+        )
+        direct_importers = {r[0] for r in importer_rows if r[0] != rel_path}
+
+        # Case A: File deleted on disk
+        if not os.path.exists(full_path):
+            try:
+                self._purge_file_nodes_and_edges(repository_id, rel_path)
+                self._refresh_importers_edges(repository_id, repo_root, direct_importers)
+                self._recompute_repository_stats(repository_id, repo)
+                repo.last_indexed_at = datetime.utcnow()
+                repo.indexing_status = "ready"
+                self.db.commit()
+                return True
+            except Exception as e:
+                self.db.rollback()
+                logger.error(f"Error purging file {rel_path} in repo {repository_id}: {e}", exc_info=True)
+                raise
+
+        # Case B: File exists on disk
+        if not is_supported_file(rel_path):
+            return False
+
+        sz = os.path.getsize(full_path)
+        if sz > MAX_FILE_SIZE:
+            logger.warning(f"File {rel_path} exceeds size limit ({sz} bytes). Skipped.")
+            return False
+
+        # Read and parse file BEFORE touching database (Requirement 7)
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        content_hash = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+        mtime = os.path.getmtime(full_path)
+        lines = content.splitlines()
+        line_count = len(lines)
+
+        parse_res = parse_source_file(rel_path, content)
+        if not parse_res:
+            return False
+
+        try:
+            # 1. Purge old nodes and edges for this file
+            self._purge_file_nodes_and_edges(repository_id, rel_path)
+
+            # 2. Insert new FILE node and symbol nodes
+            file_id = f"{repository_id}:file:{rel_path}"
+            file_node = GraphNodeModel(
+                id=file_id,
+                repository_id=repository_id,
+                node_type="FILE",
+                name=os.path.basename(rel_path),
+                qualified_name=rel_path,
+                file_path=rel_path,
+                start_line=1,
+                end_line=max(line_count, 1),
+                start_col=0,
+                end_col=0,
+                language=parse_res.language,
+                signature=f"file {os.path.basename(rel_path)}",
+                docstring="",
+                node_metadata={
+                    "size_bytes": sz,
+                    "lines": line_count,
+                    "content_hash": content_hash,
+                    "mtime": mtime,
+                },
+            )
+            nodes_to_insert = [file_node]
+            runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+            for ex_node in parse_res.nodes:
+                node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
+                db_node = GraphNodeModel(
+                    id=node_id,
+                    repository_id=repository_id,
+                    node_type=ex_node.node_type,
+                    name=ex_node.name,
+                    qualified_name=f"{rel_path}:{ex_node.qualified_name}",
+                    file_path=rel_path,
+                    start_line=ex_node.start_line,
+                    end_line=ex_node.end_line,
+                    start_col=ex_node.start_col,
+                    end_col=ex_node.end_col,
+                    language=ex_node.language,
+                    signature=ex_node.signature,
+                    docstring=ex_node.docstring,
+                    node_metadata=ex_node.metadata,
+                )
+                nodes_to_insert.append(db_node)
+
+            self.db.bulk_save_objects(nodes_to_insert)
+            self.db.flush()
+
+            # 3. Known files in repo
+            known_files = {
+                r[0]
+                for r in self.db.query(GraphNodeModel.file_path)
+                .filter(
+                    GraphNodeModel.repository_id == repository_id,
+                    GraphNodeModel.node_type == "FILE",
+                )
+                .all()
+            }
+            known_files.add(rel_path)
+
+            # 4. Construct edges for this file
+            edges = self._construct_edges_for_file(
+                repository_id=repository_id,
+                rel_path=rel_path,
+                parse_res=parse_res,
+                known_files=known_files,
+                repo_root=repo_root,
+            )
+            if edges:
+                self.db.bulk_save_objects(edges)
+                self.db.flush()
+
+            # 5. Refresh direct importers
+            self._refresh_importers_edges(repository_id, repo_root, direct_importers, known_files=known_files)
+
+            # 6. Recompute stats & commit
+            self._recompute_repository_stats(repository_id, repo)
+            repo.last_indexed_at = datetime.utcnow()
+            repo.indexing_status = "ready"
+            self.db.commit()
+            return True
+
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Failed updating file {rel_path} in repo {repository_id}: {e}", exc_info=True)
+            raise
+
+    def sync_repository(self, repository_id: str) -> Dict[str, Any]:
+        """Incrementally synchronizes a repository with its source directory on disk.
+        
+        Detects added, modified, deleted, and renamed files using content hashes and mtime.
+        Updates only affected files and their cross-file relationships.
+        
+        Args:
+            repository_id: The UUID of the repository.
+            
+        Returns:
+            Dict[str, Any] summary of changes, duration, and updated repository stats.
+        """
+        start_time = time.time()
+        repo = self.db.query(RepositoryModel).filter_by(id=repository_id).first()
+        if not repo:
+            raise ValueError(f"Repository {repository_id} not found")
+
+        repo_root = os.path.realpath(repo.source_path)
+        if not os.path.exists(repo_root) or not os.path.isdir(repo_root):
+            raise ValueError(f"Repository path '{repo.source_path}' does not exist or is not a directory.")
+
+        if not self.tsconfig_paths:
+            self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+
+        # 1. Scan disk for supported files
+        disk_files: Dict[str, str] = {}
+        for root, dirs, files in os.walk(repo_root):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            for fname in files:
+                full_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(full_path, repo_root).replace("\\", "/")
+                if not is_supported_file(rel_path):
+                    continue
+                sz = os.path.getsize(full_path)
+                if sz > MAX_FILE_SIZE:
+                    continue
+                disk_files[rel_path] = full_path
+
+        # 2. Query existing FILE nodes from DB
+        existing_file_nodes = (
+            self.db.query(GraphNodeModel)
+            .filter(
+                GraphNodeModel.repository_id == repository_id,
+                GraphNodeModel.node_type == "FILE",
+            )
+            .all()
+        )
+        db_file_map = {n.file_path: n for n in existing_file_nodes}
+
+        # 3. Detect changes
+        disk_paths = set(disk_files.keys())
+        db_paths = set(db_file_map.keys())
+
+        added_paths = disk_paths - db_paths
+        deleted_paths = db_paths - disk_paths
+        common_paths = disk_paths & db_paths
+
+        modified_paths: Set[str] = set()
+        disk_hashes: Dict[str, str] = {}
+        disk_mtimes: Dict[str, float] = {}
+        disk_sizes: Dict[str, int] = {}
+        disk_contents: Dict[str, str] = {}
+
+        for rel_path in common_paths:
+            full_path = disk_files[rel_path]
+            node = db_file_map[rel_path]
+            meta = node.node_metadata if isinstance(node.node_metadata, dict) else {}
+            db_size = meta.get("size_bytes")
+            db_hash = meta.get("content_hash")
+
+            disk_size = os.path.getsize(full_path)
+            disk_mtime = os.path.getmtime(full_path)
+            disk_sizes[rel_path] = disk_size
+            disk_mtimes[rel_path] = disk_mtime
+
+            # Read content and compute hash to verify (covers requirement 8: identical mtime and size)
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            disk_contents[rel_path] = content
+            chash = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+            disk_hashes[rel_path] = chash
+
+            if db_hash is None or chash != db_hash or (db_size is not None and disk_size != db_size):
+                modified_paths.add(rel_path)
+
+        for rel_path in added_paths:
+            full_path = disk_files[rel_path]
+            disk_sizes[rel_path] = os.path.getsize(full_path)
+            disk_mtimes[rel_path] = os.path.getmtime(full_path)
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            disk_contents[rel_path] = content
+            disk_hashes[rel_path] = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+
+        # Detect renamed files: deleted file having identical hash to added file
+        renamed: List[Dict[str, str]] = []
+        claimed_deleted: Set[str] = set()
+        deleted_hashes = {}
+        for d_path in sorted(deleted_paths):
+            d_meta = db_file_map[d_path].node_metadata if isinstance(db_file_map[d_path].node_metadata, dict) else {}
+            d_hash = d_meta.get("content_hash")
+            if d_hash:
+                deleted_hashes[d_path] = d_hash
+
+        for a_path in sorted(added_paths):
+            a_hash = disk_hashes.get(a_path)
+            if not a_hash:
+                continue
+            for d_path in sorted(deleted_paths):
+                if d_path not in claimed_deleted and deleted_hashes.get(d_path) == a_hash:
+                    renamed.append({"from": d_path, "to": a_path})
+                    claimed_deleted.add(d_path)
+                    break
+
+        total_changes = len(added_paths) + len(modified_paths) + len(deleted_paths)
+
+        # 4. Fast No-Op Exit
+        if total_changes == 0:
+            duration = time.time() - start_time
+            return {
+                "repository_id": repository_id,
+                "status": "unchanged",
+                "files_added": [],
+                "files_modified": [],
+                "files_deleted": [],
+                "files_renamed": [],
+                "total_changes": 0,
+                "duration_seconds": round(duration, 4),
+                "stats": repo.stats or self._recompute_repository_stats(repository_id, repo),
+            }
+
+        # 5. Pre-parse ALL added and modified files BEFORE modifying DB (Requirement 7)
+        parsed_files: Dict[str, ParseResult] = {}
+        files_to_parse = added_paths | modified_paths
+        for rel_path in files_to_parse:
+            content = disk_contents[rel_path]
+            res = parse_source_file(rel_path, content)
+            if res is None:
+                raise ValueError(f"Failed to parse source file: {rel_path}")
+            parsed_files[rel_path] = res
+
+        # 6. Find all direct importers of any changed files
+        all_changed_files = added_paths | modified_paths | deleted_paths
+        target_ids = [f"{repository_id}:file:{p}" for p in all_changed_files]
+        dependent_file_query = (
+            self.db.query(GraphEdgeModel.file_path)
+            .filter(
+                GraphEdgeModel.repository_id == repository_id,
+                GraphEdgeModel.edge_type == "IMPORTS",
+                GraphEdgeModel.target_id.in_(target_ids),
+            )
+            .all()
+        )
+        direct_importers = {r[0] for r in dependent_file_query if r[0] not in all_changed_files}
+
+        # 7. Apply DB mutations atomically
+        try:
+            for rel_path in deleted_paths:
+                self._purge_file_nodes_and_edges(repository_id, rel_path)
+
+            for rel_path in modified_paths:
+                self._purge_file_nodes_and_edges(repository_id, rel_path)
+
+            new_nodes: List[GraphNodeModel] = []
+            for rel_path in files_to_parse:
+                parse_res = parsed_files[rel_path]
+                content = disk_contents[rel_path]
+                lines = content.splitlines()
+                file_id = f"{repository_id}:file:{rel_path}"
+                file_node = GraphNodeModel(
+                    id=file_id,
+                    repository_id=repository_id,
+                    node_type="FILE",
+                    name=os.path.basename(rel_path),
+                    qualified_name=rel_path,
+                    file_path=rel_path,
+                    start_line=1,
+                    end_line=max(len(lines), 1),
+                    start_col=0,
+                    end_col=0,
+                    language=parse_res.language,
+                    signature=f"file {os.path.basename(rel_path)}",
+                    docstring="",
+                    node_metadata={
+                        "size_bytes": disk_sizes[rel_path],
+                        "lines": len(lines),
+                        "content_hash": disk_hashes[rel_path],
+                        "mtime": disk_mtimes[rel_path],
+                    },
+                )
+                new_nodes.append(file_node)
+
+                runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+                for ex_node in parse_res.nodes:
+                    node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
+                    db_node = GraphNodeModel(
+                        id=node_id,
+                        repository_id=repository_id,
+                        node_type=ex_node.node_type,
+                        name=ex_node.name,
+                        qualified_name=f"{rel_path}:{ex_node.qualified_name}",
+                        file_path=rel_path,
+                        start_line=ex_node.start_line,
+                        end_line=ex_node.end_line,
+                        start_col=ex_node.start_col,
+                        end_col=ex_node.end_col,
+                        language=ex_node.language,
+                        signature=ex_node.signature,
+                        docstring=ex_node.docstring,
+                        node_metadata=ex_node.metadata,
+                    )
+                    new_nodes.append(db_node)
+
+            self.db.bulk_save_objects(new_nodes)
+            self.db.flush()
+
+            known_files = (db_paths - deleted_paths) | added_paths
+
+            new_edges: List[GraphEdgeModel] = []
+            for rel_path in files_to_parse:
+                file_edges = self._construct_edges_for_file(
+                    repository_id=repository_id,
+                    rel_path=rel_path,
+                    parse_res=parsed_files[rel_path],
+                    known_files=known_files,
+                    repo_root=repo_root,
+                )
+                new_edges.extend(file_edges)
+
+            if new_edges:
+                self.db.bulk_save_objects(new_edges)
+                self.db.flush()
+
+            self._refresh_importers_edges(
+                repository_id=repository_id,
+                repo_root=repo_root,
+                direct_importers=direct_importers,
+                known_files=known_files,
+            )
+
+            stats = self._recompute_repository_stats(repository_id, repo)
+            repo.last_indexed_at = datetime.utcnow()
+            repo.indexing_status = "ready"
+            repo.error_message = None
+            self.db.commit()
+
+            duration = time.time() - start_time
+            return {
+                "repository_id": repository_id,
+                "status": "synchronized",
+                "files_added": sorted(list(added_paths)),
+                "files_modified": sorted(list(modified_paths)),
+                "files_deleted": sorted(list(deleted_paths)),
+                "files_renamed": renamed,
+                "total_changes": total_changes,
+                "duration_seconds": round(duration, 4),
+                "stats": stats,
+            }
+
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Failed incremental synchronization for repo {repository_id}: {e}", exc_info=True)
+            raise
