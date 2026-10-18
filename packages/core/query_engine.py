@@ -5,6 +5,7 @@ blast-radius calculations, and test discovery with evidence.
 """
 
 from collections import deque
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
@@ -16,6 +17,16 @@ from packages.core.models import (
     ImpactAnalysisResult,
     SearchResult,
 )
+
+
+def _tokenize_query_terms(text: str) -> List[str]:
+    """Splits identifiers and query phrases on spaces, delimiters, and camelCase boundaries."""
+    if not text:
+        return []
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    tokens = re.split(r"[^a-zA-Z0-9]+", s)
+    return [t.lower() for t in tokens if t]
 
 
 class GraphQueryEngine:
@@ -51,8 +62,32 @@ class GraphQueryEngine:
         file_path_filter: Optional[str] = None,
         limit: int = 50,
     ) -> List[SearchResult]:
-        """Performs lexical and structural code search across symbols and files."""
-        q = query_text.strip().lower()
+        """Performs multi-term tokenized and structural code search across symbols and files.
+
+        Handles natural language space-separated queries, snake_case, camelCase, and
+        exact identifiers, ranking results by structural relevance and term coverage.
+
+        Args:
+            query_text: The search query string.
+            repo_id: Optional repository UUID to scope search.
+            node_type: Optional node category filter (FUNCTION, METHOD, CLASS, etc.).
+            file_path_filter: Optional substring filter on file path.
+            limit: Maximum number of search results to return (default 50).
+
+        Returns:
+            A deterministically sorted list of SearchResult objects ordered by match relevance,
+            with ties broken by file path, start line, and qualified name.
+        """
+        if not query_text or not query_text.strip():
+            return []
+
+        q_clean = query_text.strip()
+        q_lower = q_clean.lower()
+        query_tokens = _tokenize_query_terms(q_clean)
+
+        if not query_tokens:
+            return []
+
         query = self.db.query(GraphNodeModel)
 
         if repo_id:
@@ -62,31 +97,111 @@ class GraphQueryEngine:
         if file_path_filter:
             query = query.filter(GraphNodeModel.file_path.ilike(f"%{file_path_filter}%"))
 
-        # Match by name, qualified_name, or docstring
-        query = query.filter(
-            or_(
-                GraphNodeModel.name.ilike(f"%{q}%"),
-                GraphNodeModel.qualified_name.ilike(f"%{q}%"),
-                GraphNodeModel.file_path.ilike(f"%{q}%"),
-                GraphNodeModel.docstring.ilike(f"%{q}%"),
+        # Build candidate filter: match any term or exact substring
+        term_clauses = [
+            GraphNodeModel.name.ilike(f"%{q_lower}%"),
+            GraphNodeModel.qualified_name.ilike(f"%{q_lower}%"),
+            GraphNodeModel.file_path.ilike(f"%{q_lower}%"),
+            GraphNodeModel.docstring.ilike(f"%{q_lower}%"),
+        ]
+        for tok in query_tokens:
+            term_clauses.append(GraphNodeModel.name.ilike(f"%{tok}%"))
+            term_clauses.append(GraphNodeModel.qualified_name.ilike(f"%{tok}%"))
+            term_clauses.append(GraphNodeModel.file_path.ilike(f"%{tok}%"))
+            term_clauses.append(GraphNodeModel.docstring.ilike(f"%{tok}%"))
+
+        query = query.filter(or_(*term_clauses))
+
+        # Retrieve candidates with headroom for scoring and deduplication
+        candidate_limit = max(limit * 5, 100)
+        candidates = query.limit(candidate_limit).all()
+
+        if not candidates:
+            return []
+
+        num_query = len(query_tokens)
+        scored_results: List[Tuple[float, GraphNodeModel, str]] = []
+
+        for n in candidates:
+            name_lower = n.name.lower()
+            name_tokens = _tokenize_query_terms(n.name)
+            qual_tokens = _tokenize_query_terms(n.qualified_name)
+            file_tokens = _tokenize_query_terms(n.file_path)
+            doc_tokens = _tokenize_query_terms(n.docstring)
+
+            # 1. Exact match on symbol name (highest priority)
+            if name_lower == q_lower:
+                score = 1.0
+            # 2. Exact token equality (e.g. "calculate sum" == ["calculate", "sum"] in calculate_sum)
+            elif query_tokens == name_tokens:
+                score = 0.95
+            else:
+                name_matches = sum(
+                    1
+                    for q in query_tokens
+                    if q in name_tokens or any(nt.startswith(q) for nt in name_tokens)
+                )
+
+                if name_matches == num_query:
+                    # All terms appear in the symbol name
+                    joined_tokens = "".join(query_tokens)
+                    joined_snake = "_".join(query_tokens)
+                    if name_lower.startswith(joined_tokens) or name_lower.startswith(joined_snake):
+                        score = 0.92
+                    else:
+                        score = 0.88
+                else:
+                    # Check all terms across structural fields (name + qual + file_path)
+                    struct_tokens = set(name_tokens + qual_tokens + file_tokens)
+                    struct_matches = sum(
+                        1
+                        for q in query_tokens
+                        if q in struct_tokens or any(st.startswith(q) for st in struct_tokens)
+                    )
+
+                    if struct_matches == num_query:
+                        # Multi-term match across path / class / symbol (e.g. "math add")
+                        score = 0.78
+                    else:
+                        doc_matches = sum(
+                            1
+                            for q in query_tokens
+                            if q in doc_tokens or any(dt.startswith(q) for dt in doc_tokens)
+                        )
+                        if doc_matches == num_query:
+                            # All terms match docstring
+                            score = 0.65
+                        elif name_matches > 0:
+                            # Partial symbol name match
+                            score = round(0.50 + 0.10 * (name_matches / num_query), 2)
+                        elif struct_matches > 0:
+                            # Partial structural match
+                            score = round(0.40 + 0.10 * (struct_matches / num_query), 2)
+                        elif doc_matches > 0:
+                            # Partial docstring match
+                            score = 0.35
+                        else:
+                            score = 0.20
+
+            snippet = n.signature or n.docstring or f"{n.node_type} {n.name} ({n.file_path}:{n.start_line})"
+            scored_results.append((score, n, snippet))
+
+        # Deterministic ranking:
+        # 1. Score descending (-score)
+        # 2. File path ascending
+        # 3. Start line ascending
+        # 4. Qualified name ascending
+        scored_results.sort(
+            key=lambda item: (
+                -item[0],
+                item[1].file_path,
+                item[1].start_line,
+                item[1].qualified_name,
             )
         )
 
-        nodes = query.limit(limit).all()
         results: List[SearchResult] = []
-        for n in nodes:
-            # Score relevance
-            name_lower = n.name.lower()
-            if name_lower == q:
-                score = 1.0
-            elif name_lower.startswith(q):
-                score = 0.85
-            elif q in name_lower:
-                score = 0.7
-            else:
-                score = 0.5
-
-            snippet = n.signature or n.docstring or f"{n.node_type} {n.name} ({n.file_path}:{n.start_line})"
+        for score, n, snippet in scored_results[:limit]:
             results.append(
                 SearchResult(
                     node=GraphNodeSchema.model_validate(n),
@@ -95,8 +210,6 @@ class GraphQueryEngine:
                 )
             )
 
-        # Sort highest score first
-        results.sort(key=lambda r: r.match_score, reverse=True)
         return results
 
     def get_symbol_details(self, node_id: str) -> Optional[Dict[str, Any]]:
