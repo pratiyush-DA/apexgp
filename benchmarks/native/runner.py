@@ -96,9 +96,21 @@ def index_benchmark_fixture(
 def compute_retrieval_metrics(
     results: List[SearchResult], expected_targets: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Computes Hit@1, Recall@K, and MRR for ranked search results."""
+    """Computes Hit@1, Recall@K, and MRR for ranked search results, or negative rejection metrics for zero-target tasks."""
     if not expected_targets:
-        return {}
+        is_clean = len(results) == 0
+        return {
+            "is_zero_target": True,
+            "negative_rejection_success": 1.0 if is_clean else 0.0,
+            "distractor_count": len(results),
+            "retrieved_count": len(results),
+            "hit_at_1": None,
+            "recall_at_1": None,
+            "recall_at_3": None,
+            "recall_at_5": None,
+            "mrr": None,
+            "top_rank": None,
+        }
 
     num_expected = len(expected_targets)
     expected_keys = {(t["name"].lower(), t["file_path"].lower()) for t in expected_targets}
@@ -121,6 +133,7 @@ def compute_retrieval_metrics(
     mrr = (1.0 / found_ranks[0]) if found_ranks else 0.0
 
     return {
+        "is_zero_target": False,
         "hit_at_1": hit_at_1,
         "recall_at_1": recall_at_1,
         "recall_at_3": recall_at_3,
@@ -208,14 +221,19 @@ def execute_task(
         task_metrics = compute_retrieval_metrics(raw_result, expected_targets)
         min_rank = crit.get("min_rank", 1)
         min_score = crit.get("min_score", 0.70)
+        expected_count = crit.get("expected_count")
 
-        # Check if top expected item matches within min_rank and score
-        top_rank = task_metrics.get("top_rank")
-        if top_rank is not None and top_rank <= min_rank:
-            # Check score of top result
-            top_result = raw_result[top_rank - 1]
-            if top_result.match_score >= min_score:
-                correct = True
+        if expected_count is not None:
+            correct = len(raw_result) == expected_count
+            task_metrics["distractor_count"] = len(raw_result)
+        else:
+            # Check if top expected item matches within min_rank and score
+            top_rank = task_metrics.get("top_rank")
+            if top_rank is not None and top_rank <= min_rank:
+                # Check score of top result
+                top_result = raw_result[top_rank - 1]
+                if top_result.match_score >= min_score:
+                    correct = True
 
     elif query_type == "analyze_change_impact":
         affected_files = set(raw_result.affected_files)
@@ -335,26 +353,40 @@ def run_benchmark_suite(
     accuracy_rate = (passed_tasks / total_tasks) if total_tasks > 0 else 0.0
 
     retrieval_tasks = [t for t in task_results if t["query_type"] == "search_code"]
-    retrieval_count = len(retrieval_tasks)
+    pos_retrieval_tasks = [
+        t for t in retrieval_tasks if not t["metrics"].get("is_zero_target", False)
+    ]
+    neg_retrieval_tasks = [
+        t for t in retrieval_tasks if t["metrics"].get("is_zero_target", False)
+    ]
+
+    pos_count = len(pos_retrieval_tasks)
     mean_hit_at_1 = (
-        sum(t["metrics"]["hit_at_1"] for t in retrieval_tasks) / retrieval_count
-        if retrieval_count > 0
+        sum(t["metrics"]["hit_at_1"] for t in pos_retrieval_tasks) / pos_count
+        if pos_count > 0
         else 0.0
     )
     mean_recall_at_3 = (
-        sum(t["metrics"]["recall_at_3"] for t in retrieval_tasks) / retrieval_count
-        if retrieval_count > 0
+        sum(t["metrics"]["recall_at_3"] for t in pos_retrieval_tasks) / pos_count
+        if pos_count > 0
         else 0.0
     )
     mean_recall_at_5 = (
-        sum(t["metrics"]["recall_at_5"] for t in retrieval_tasks) / retrieval_count
-        if retrieval_count > 0
+        sum(t["metrics"]["recall_at_5"] for t in pos_retrieval_tasks) / pos_count
+        if pos_count > 0
         else 0.0
     )
     mean_mrr = (
-        sum(t["metrics"]["mrr"] for t in retrieval_tasks) / retrieval_count
-        if retrieval_count > 0
+        sum(t["metrics"]["mrr"] for t in pos_retrieval_tasks) / pos_count
+        if pos_count > 0
         else 0.0
+    )
+
+    neg_count = len(neg_retrieval_tasks)
+    negative_rejection_accuracy = (
+        sum(t["metrics"]["negative_rejection_success"] for t in neg_retrieval_tasks) / neg_count
+        if neg_count > 0
+        else 1.0
     )
 
     impact_tasks = [t for t in task_results if t["query_type"] == "analyze_change_impact"]
@@ -403,11 +435,13 @@ def run_benchmark_suite(
             "suite_execution_duration_ms": round(total_duration_ms, 2),
             "mean_query_latency_ms": round(mean_query_latency_ms, 3),
             "retrieval": {
-                "task_count": retrieval_count,
+                "task_count": pos_count,
                 "mean_hit_at_1": round(mean_hit_at_1, 4),
                 "mean_recall_at_3": round(mean_recall_at_3, 4),
                 "mean_recall_at_5": round(mean_recall_at_5, 4),
                 "mean_mrr": round(mean_mrr, 4),
+                "negative_rejection_task_count": neg_count,
+                "negative_rejection_accuracy": round(negative_rejection_accuracy, 4),
             },
             "graph_traversal": {
                 "impact_task_count": len(impact_tasks),
@@ -438,12 +472,14 @@ def print_summary_table(report: Dict[str, Any]) -> None:
         tokens = str(t["performance"]["approx_tokens"])
         print(f"{t['task_id']:<28} {t['category']:<20} {status:<8} {lat:<12} {tokens:<8}")
     print("-" * 80)
-    print(f"Overall Accuracy:       {agg['passed_tasks']}/{agg['total_tasks']} ({agg['accuracy_rate'] * 100:.1f}%)")
-    print(f"Retrieval Hit@1:        {agg['retrieval']['mean_hit_at_1'] * 100:.1f}% (N={agg['retrieval']['task_count']})")
-    print(f"Retrieval Recall@3:     {agg['retrieval']['mean_recall_at_3'] * 100:.1f}%")
-    print(f"Retrieval MRR:          {agg['retrieval']['mean_mrr']:.3f}")
-    print(f"Impact File Recall:     {agg['graph_traversal']['mean_impact_file_recall'] * 100:.1f}%")
-    print(f"Linked Test Recall:     {agg['graph_traversal']['mean_linked_test_recall'] * 100:.1f}%")
+    print(f"Overall Accuracy:            {agg['passed_tasks']}/{agg['total_tasks']} ({agg['accuracy_rate'] * 100:.1f}%)")
+    print(f"Retrieval Hit@1:             {agg['retrieval']['mean_hit_at_1'] * 100:.1f}% (N={agg['retrieval']['task_count']})")
+    print(f"Retrieval Recall@3:          {agg['retrieval']['mean_recall_at_3'] * 100:.1f}%")
+    print(f"Retrieval MRR:               {agg['retrieval']['mean_mrr']:.3f}")
+    if agg["retrieval"].get("negative_rejection_task_count", 0) > 0:
+        print(f"Negative Rejection Accuracy: {agg['retrieval']['negative_rejection_accuracy'] * 100:.1f}% (N={agg['retrieval']['negative_rejection_task_count']})")
+    print(f"Impact File Recall:          {agg['graph_traversal']['mean_impact_file_recall'] * 100:.1f}%")
+    print(f"Linked Test Recall:          {agg['graph_traversal']['mean_linked_test_recall'] * 100:.1f}%")
     print(f"Indexing Duration:      {agg['indexing_duration_ms']:.2f}ms")
     print(f"Mean Query Latency:     {agg['mean_query_latency_ms']:.2f}ms")
     print(f"Suite Total Runtime:    {agg['suite_execution_duration_ms']:.2f}ms")

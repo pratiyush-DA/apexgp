@@ -7,7 +7,7 @@ blast-radius calculations, and test discovery with evidence.
 from collections import deque
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
-from sqlalchemy import or_, text
+from sqlalchemy import case, or_, text
 from sqlalchemy.orm import Session
 
 from packages.core.models import (
@@ -17,6 +17,12 @@ from packages.core.models import (
     ImpactAnalysisResult,
     SearchResult,
 )
+
+
+STOP_WORDS = {
+    "how", "to", "the", "in", "of", "a", "an", "is", "for", "and", "or",
+    "what", "where", "which", "with", "by", "from", "on", "at",
+}
 
 
 def _tokenize_query_terms(text: str) -> List[str]:
@@ -88,6 +94,11 @@ class GraphQueryEngine:
         if not query_tokens:
             return []
 
+        is_file_query = bool(re.search(r"\.[a-zA-Z0-9]+$", q_clean) or "/" in q_clean or "\\" in q_clean)
+        substantive_tokens = [t for t in query_tokens if t not in STOP_WORDS]
+        eval_tokens = substantive_tokens if substantive_tokens else query_tokens
+        num_eval = len(eval_tokens)
+
         query = self.db.query(GraphNodeModel)
 
         if repo_id:
@@ -112,6 +123,16 @@ class GraphQueryEngine:
 
         query = query.filter(or_(*term_clauses))
 
+        # Prioritize candidate selection at database level to protect against truncation
+        query = query.order_by(
+            case(
+                (GraphNodeModel.name.ilike(q_lower), 0),
+                (GraphNodeModel.name.ilike(f"%{q_lower}%"), 1),
+                (GraphNodeModel.qualified_name.ilike(f"%{q_lower}%"), 2),
+                else_=3,
+            )
+        )
+
         # Retrieve candidates with headroom for scoring and deduplication
         candidate_limit = max(limit * 5, 100)
         candidates = query.limit(candidate_limit).all()
@@ -124,59 +145,67 @@ class GraphQueryEngine:
 
         for n in candidates:
             name_lower = n.name.lower()
+            qual_lower = n.qualified_name.lower()
+            qual_simple = qual_lower.split(":")[-1]
             name_tokens = _tokenize_query_terms(n.name)
             qual_tokens = _tokenize_query_terms(n.qualified_name)
             file_tokens = _tokenize_query_terms(n.file_path)
             doc_tokens = _tokenize_query_terms(n.docstring)
 
-            # 1. Exact match on symbol name (highest priority)
+            # 1. Exact match on simple symbol name
             if name_lower == q_lower:
                 score = 1.0
-            # 2. Exact token equality (e.g. "calculate sum" == ["calculate", "sum"] in calculate_sum)
+            # 2. Exact match on qualified symbol name (e.g. Calculator.calculate_sum)
+            elif qual_lower == q_lower or qual_simple == q_lower:
+                score = 0.98
+            # 3. Exact token equality on full query (e.g. "calculate sum" == ["calculate", "sum"])
             elif query_tokens == name_tokens:
                 score = 0.95
+            # 4. Exact token equality on substantive tokens (when stop words present, e.g. "how to calculate sum")
+            elif substantive_tokens and substantive_tokens == name_tokens:
+                score = 0.90
             else:
                 name_matches = sum(
                     1
-                    for q in query_tokens
+                    for q in eval_tokens
                     if q in name_tokens or any(nt.startswith(q) for nt in name_tokens)
                 )
 
-                if name_matches == num_query:
-                    # All terms appear in the symbol name
-                    joined_tokens = "".join(query_tokens)
-                    joined_snake = "_".join(query_tokens)
+                if name_matches == num_eval:
+                    # All evaluated terms appear in the symbol name
+                    joined_tokens = "".join(eval_tokens)
+                    joined_snake = "_".join(eval_tokens)
                     if name_lower.startswith(joined_tokens) or name_lower.startswith(joined_snake):
                         score = 0.92
                     else:
                         score = 0.88
                 else:
-                    # Check all terms across structural fields (name + qual + file_path)
+                    # Check all evaluated terms across structural fields (name + qual + file_path)
                     struct_tokens = set(name_tokens + qual_tokens + file_tokens)
                     struct_matches = sum(
                         1
-                        for q in query_tokens
+                        for q in eval_tokens
                         if q in struct_tokens or any(st.startswith(q) for st in struct_tokens)
                     )
 
-                    if struct_matches == num_query:
+                    if struct_matches == num_eval:
                         # Multi-term match across path / class / symbol (e.g. "math add")
                         score = 0.78
                     else:
                         doc_matches = sum(
                             1
-                            for q in query_tokens
+                            for q in eval_tokens
                             if q in doc_tokens or any(dt.startswith(q) for dt in doc_tokens)
                         )
-                        if doc_matches == num_query:
+                        if doc_matches == num_eval:
                             # All terms match docstring
                             score = 0.65
                         elif name_matches > 0:
                             # Partial symbol name match
-                            score = round(0.50 + 0.10 * (name_matches / num_query), 2)
+                            score = round(0.50 + 0.10 * (name_matches / num_eval), 2)
                         elif struct_matches > 0:
                             # Partial structural match
-                            score = round(0.40 + 0.10 * (struct_matches / num_query), 2)
+                            score = round(0.40 + 0.10 * (struct_matches / num_eval), 2)
                         elif doc_matches > 0:
                             # Partial docstring match
                             score = 0.35
@@ -188,12 +217,14 @@ class GraphQueryEngine:
 
         # Deterministic ranking:
         # 1. Score descending (-score)
-        # 2. File path ascending
-        # 3. Start line ascending
-        # 4. Qualified name ascending
+        # 2. Prefer functional symbols over FILE containers on symbol-directed queries
+        # 3. File path ascending
+        # 4. Start line ascending
+        # 5. Qualified name ascending
         scored_results.sort(
             key=lambda item: (
                 -item[0],
+                1 if (not is_file_query and item[1].node_type == "FILE") else 0,
                 item[1].file_path,
                 item[1].start_line,
                 item[1].qualified_name,

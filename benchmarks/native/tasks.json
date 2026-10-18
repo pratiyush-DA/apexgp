@@ -126,6 +126,87 @@
       "relevance_criterion": {
         "must_be_acyclic": true
       }
+    },
+    {
+      "task_id": "T7_QUALIFIED_IDENTIFIER",
+      "category": "qualified_retrieval",
+      "difficulty": "localized",
+      "description": "Find method by exact qualified identifier Calculator.calculate_sum",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "Calculator.calculate_sum",
+        "limit": 5
+      },
+      "expected_targets": [
+        {
+          "name": "calculate_sum",
+          "file_path": "calculator.py",
+          "node_type": "METHOD"
+        }
+      ],
+      "relevance_criterion": {
+        "min_rank": 1,
+        "min_score": 0.95
+      }
+    },
+    {
+      "task_id": "T8_SYMBOL_PRECEDENCE",
+      "category": "symbol_precedence",
+      "difficulty": "leaf",
+      "description": "Ensure functional symbol formatResult outranks container FILE node for symbol query 'format'",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "format",
+        "limit": 5
+      },
+      "expected_targets": [
+        {
+          "name": "formatResult",
+          "file_path": "formatter.ts",
+          "node_type": "FUNCTION"
+        }
+      ],
+      "relevance_criterion": {
+        "min_rank": 1,
+        "min_score": 0.88
+      }
+    },
+    {
+      "task_id": "T9_NATURAL_QUERY_STOPWORDS",
+      "category": "natural_language",
+      "difficulty": "localized",
+      "description": "Find sum calculation utility using natural language query with stop words",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "how to calculate sum",
+        "limit": 5
+      },
+      "expected_targets": [
+        {
+          "name": "calculate_sum",
+          "file_path": "calculator.py",
+          "node_type": "METHOD"
+        }
+      ],
+      "relevance_criterion": {
+        "min_rank": 1,
+        "min_score": 0.85
+      }
+    },
+    {
+      "task_id": "T10_ZERO_DISTRACTOR_CLEAN",
+      "category": "distractor_rejection",
+      "difficulty": "diagnostic",
+      "description": "Precision check ensuring completely non-existent query returns zero distractor results",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "quantum_teleportation_verifier",
+        "limit": 5
+      },
+      "expected_targets": [],
+      "relevance_criterion": {
+        "expected_count": 0
+      }
     }
   ]
 }

@@ -302,3 +302,87 @@ def test_limit_constraint(indexed_sample_repo, shared_db):
     assert len(results_limit_1) == 1
     assert len(results_limit_2) == 2
     assert results_limit_1[0].node.id == results_limit_2[0].node.id
+
+
+def test_exact_qualified_name_prioritization(indexed_sample_repo, shared_db):
+    """13. Exact qualified name matches (e.g. Calculator.calculate_sum) rank at top with high score."""
+    engine = GraphQueryEngine(shared_db)
+    results = engine.search_code("Calculator.calculate_sum", repo_id=indexed_sample_repo.id)
+    assert len(results) >= 1
+    top = results[0]
+    assert top.node.name == "calculate_sum"
+    assert top.node.qualified_name.endswith("Calculator.calculate_sum")
+    assert top.match_score >= 0.95
+
+
+def test_symbol_precedence_over_file_containers(indexed_sample_repo, shared_db):
+    """14. Functional symbols outrank FILE containers on symbol queries, while explicit file searches preserve FILE at top."""
+    engine = GraphQueryEngine(shared_db)
+
+    # Symbol-directed query: FUNCTION should outrank FILE container
+    results = engine.search_code("format", repo_id=indexed_sample_repo.id)
+    assert len(results) >= 2
+    assert results[0].node.node_type == "FUNCTION"
+    assert results[0].node.name == "formatResult"
+
+    # Explicit file query: FILE container should rank at top
+    file_results = engine.search_code("formatter.ts", repo_id=indexed_sample_repo.id)
+    assert len(file_results) >= 1
+    assert file_results[0].node.node_type == "FILE"
+    assert file_results[0].node.file_path == "formatter.ts"
+    assert file_results[0].match_score == 1.0
+
+
+def test_stopwords_resilience(indexed_sample_repo, shared_db):
+    """15. Natural-language stop words do not dilute the score or precision of substantive query tokens."""
+    engine = GraphQueryEngine(shared_db)
+    results = engine.search_code("how to calculate sum", repo_id=indexed_sample_repo.id)
+    assert len(results) >= 1
+    top = results[0]
+    assert top.node.name == "calculate_sum"
+    assert top.match_score >= 0.85
+    # calculate_product should be ranked lower with noticeable separation
+    product_res = next((r for r in results if r.node.name == "calculate_product"), None)
+    if product_res:
+        assert top.match_score > product_res.match_score + 0.20
+
+
+def test_candidate_truncation_exact_symbol_preservation(isolated_db):
+    """16. SQL candidate retrieval ordering prevents candidate truncation when over 100 partial matches exist."""
+    ws = WorkspaceModel(name="Truncation WS")
+    isolated_db.add(ws)
+    isolated_db.commit()
+    repo = RepositoryModel(workspace_id=ws.id, name="Truncation Repo", source_type="local", source_path="/tmp")
+    isolated_db.add(repo)
+    isolated_db.commit()
+
+    # Add 105 distractor nodes whose docstrings contain 'add' (e.g. 'address validation')
+    for i in range(105):
+        _add_custom_node(
+            isolated_db,
+            repo.id,
+            name=f"worker_{i:03d}",
+            file_path=f"workers/worker_{i:03d}.py",
+            docstring="Performs address resolution and memory addition padding routines.",
+            start_line=1,
+        )
+
+    # Add the exact target node 'add'
+    _add_custom_node(
+        isolated_db,
+        repo.id,
+        name="add",
+        file_path="math_utils.py",
+        docstring="Adds two numbers together.",
+        start_line=5,
+    )
+
+    engine = GraphQueryEngine(isolated_db)
+    # Search for 'add' with default candidate pool (100)
+    results = engine.search_code("add", repo_id=repo.id, limit=10)
+
+    assert len(results) >= 1
+    assert results[0].node.name == "add"
+    assert results[0].node.file_path == "math_utils.py"
+    assert results[0].match_score == 1.0
+

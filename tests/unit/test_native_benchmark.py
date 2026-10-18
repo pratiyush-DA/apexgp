@@ -52,7 +52,7 @@ def test_task_definitions_structure_and_completeness(tasks_file_path: Path):
     assert "benchmark_version" in data
     assert "tasks" in data
     tasks = data["tasks"]
-    assert len(tasks) == 6
+    assert len(tasks) == 10
 
     task_ids = set()
     valid_query_types = {
@@ -134,8 +134,22 @@ def test_compute_retrieval_metrics_lower_rank_and_empty():
     assert empty_metrics["mrr"] == 0.0
     assert empty_metrics["top_rank"] is None
 
-    # Empty expected targets case
-    assert compute_retrieval_metrics(results, []) == {}
+    # Empty expected targets case (distractor detection)
+    zero_target_metrics_dirty = compute_retrieval_metrics(results, [])
+    assert zero_target_metrics_dirty["is_zero_target"] is True
+    assert zero_target_metrics_dirty["negative_rejection_success"] == 0.0
+    assert zero_target_metrics_dirty["distractor_count"] == 3
+    assert zero_target_metrics_dirty["retrieved_count"] == 3
+    assert zero_target_metrics_dirty["hit_at_1"] is None
+    assert zero_target_metrics_dirty["mrr"] is None
+
+    zero_target_metrics_clean = compute_retrieval_metrics([], [])
+    assert zero_target_metrics_clean["is_zero_target"] is True
+    assert zero_target_metrics_clean["negative_rejection_success"] == 1.0
+    assert zero_target_metrics_clean["distractor_count"] == 0
+    assert zero_target_metrics_clean["retrieved_count"] == 0
+    assert zero_target_metrics_clean["hit_at_1"] is None
+    assert zero_target_metrics_clean["mrr"] is None
 
 
 def test_in_memory_database_isolation(sample_repo_path: Path):
@@ -174,23 +188,25 @@ def test_run_benchmark_suite_execution_and_schema():
 
     assert "aggregate_metrics" in report
     agg = report["aggregate_metrics"]
-    assert agg["total_tasks"] == 6
-    assert agg["passed_tasks"] == 6
+    assert agg["total_tasks"] == 10
+    assert agg["passed_tasks"] == 10
     assert agg["accuracy_rate"] == 1.0
     assert agg["indexing_duration_ms"] > 0
     assert agg["suite_execution_duration_ms"] > 0
     assert agg["mean_query_latency_ms"] > 0
 
-    assert agg["retrieval"]["task_count"] == 3
+    assert agg["retrieval"]["task_count"] == 6
     assert agg["retrieval"]["mean_hit_at_1"] == 1.0
     assert agg["retrieval"]["mean_recall_at_3"] == 1.0
     assert agg["retrieval"]["mean_mrr"] == 1.0
+    assert agg["retrieval"]["negative_rejection_task_count"] == 1
+    assert agg["retrieval"]["negative_rejection_accuracy"] == 1.0
 
     assert agg["graph_traversal"]["impact_task_count"] == 1
     assert agg["graph_traversal"]["mean_impact_file_recall"] == 1.0
     assert agg["graph_traversal"]["mean_linked_test_recall"] == 1.0
 
-    assert len(report["tasks"]) == 6
+    assert len(report["tasks"]) == 10
     for t in report["tasks"]:
         assert t["correct"] is True
         assert t["performance"]["payload_bytes"] > 0
@@ -256,4 +272,52 @@ def test_no_legacy_or_external_processes_invoked(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", guarded_popen)
     report = run_benchmark_suite(repetitions=1)
-    assert report["aggregate_metrics"]["passed_tasks"] == 6
+    assert report["aggregate_metrics"]["passed_tasks"] == 10
+
+
+def test_zero_target_rejection_task_execution(sample_repo_path: Path):
+    """8. Verifies task execution for both successful and unsuccessful zero-target negative rejection."""
+    session = create_in_memory_database()
+    indexed_repo, _ = index_benchmark_fixture(session, sample_repo_path)
+    engine = GraphQueryEngine(session)
+
+    # Case A: Successful rejection (clean zero results on non-existent query)
+    clean_task = {
+        "task_id": "CLEAN_REJECTION_TEST",
+        "category": "distractor_rejection",
+        "difficulty": "diagnostic",
+        "description": "Zero distractor verification",
+        "query_type": "search_code",
+        "query_params": {"query_text": "non_existent_symbol_xyz", "limit": 5},
+        "expected_targets": [],
+        "relevance_criterion": {"expected_count": 0},
+    }
+    clean_res = execute_task(engine, indexed_repo.id, clean_task, repetitions=1)
+    assert clean_res["correct"] is True
+    assert clean_res["metrics"]["is_zero_target"] is True
+    assert clean_res["metrics"]["negative_rejection_success"] == 1.0
+    assert clean_res["metrics"]["distractor_count"] == 0
+    assert clean_res["metrics"]["hit_at_1"] is None
+    assert clean_res["metrics"]["mrr"] is None
+
+    # Case B: Unsuccessful rejection (query matching symbols when 0 expected)
+    dirty_task = {
+        "task_id": "DIRTY_REJECTION_TEST",
+        "category": "distractor_rejection",
+        "difficulty": "diagnostic",
+        "description": "Distractor failure verification",
+        "query_type": "search_code",
+        "query_params": {"query_text": "calculate", "limit": 5},
+        "expected_targets": [],
+        "relevance_criterion": {"expected_count": 0},
+    }
+    dirty_res = execute_task(engine, indexed_repo.id, dirty_task, repetitions=1)
+    assert dirty_res["correct"] is False
+    assert dirty_res["metrics"]["is_zero_target"] is True
+    assert dirty_res["metrics"]["negative_rejection_success"] == 0.0
+    assert dirty_res["metrics"]["distractor_count"] > 0
+    assert dirty_res["metrics"]["hit_at_1"] is None
+    assert dirty_res["metrics"]["mrr"] is None
+
+    session.close()
+
