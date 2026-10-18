@@ -8,13 +8,15 @@ from collections import deque
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlalchemy import case, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from packages.core.models import (
+    GodNodeItem,
     GraphEdgeModel,
     GraphNodeModel,
     GraphNodeSchema,
     ImpactAnalysisResult,
+    RepositoryModel,
     SearchResult,
 )
 
@@ -895,4 +897,137 @@ class GraphQueryEngine:
         # 5. Deterministic sorting: components sorted by first file path, then length
         cyclic_components.sort(key=lambda c: (c[0], len(c)))
         return cyclic_components
+
+    def get_god_nodes(
+        self,
+        repo_id: str,
+        limit: int = 20,
+        scope: str = "all",
+    ) -> List[GodNodeItem]:
+        """Identifies architectural hub nodes (god nodes) ranked by connectivity and call centrality.
+
+        Scoring formula:
+            god_score = 2 * in_degree + 3 * incoming_calls + out_degree
+
+        Note: incoming_calls are included in in_degree, so each incoming CALLS relationship
+        contributes 5 points total (2 points from in_degree + 3 points from incoming_calls).
+        All metrics count distinct internal relationships within the repository.
+        External stubs and cross-repository edges are strictly excluded from internal degrees
+        and candidate results.
+
+        Args:
+            repo_id: Repository UUID.
+            limit: Maximum results to return (default 20). Returns [] if limit <= 0.
+            scope: Filter scope:
+                - 'all': Ranks all internal nodes (files and symbols).
+                - 'file': Ranks only FILE container nodes.
+                - 'symbol': Ranks only symbols (all non-FILE nodes).
+
+        Returns:
+            Deterministically sorted list of GodNodeItem objects.
+
+        Raises:
+            ValueError: If repository repo_id does not exist or scope is invalid.
+        """
+        repo = self.db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            raise ValueError(f"Repository '{repo_id}' not found")
+
+        if scope not in ("all", "file", "symbol"):
+            raise ValueError(f"Invalid scope '{scope}'. Must be 'all', 'file', or 'symbol'")
+
+        if limit <= 0:
+            return []
+
+        # 1. Fetch all valid, internal, deduplicated relationships within repo_id.
+        # Both source and target must be internal nodes belonging to repo_id.
+        # Deduplicating on (source_id, target_id, edge_type) ensures:
+        # - Duplicate stored edges for the same relationship type are counted once.
+        # - Distinct relationship types between the same endpoints are preserved.
+        SourceNode = aliased(GraphNodeModel)
+        TargetNode = aliased(GraphNodeModel)
+
+        valid_edges = (
+            self.db.query(
+                GraphEdgeModel.source_id,
+                GraphEdgeModel.target_id,
+                GraphEdgeModel.edge_type,
+            )
+            .join(SourceNode, GraphEdgeModel.source_id == SourceNode.id)
+            .join(TargetNode, GraphEdgeModel.target_id == TargetNode.id)
+            .filter(
+                GraphEdgeModel.repository_id == repo_id,
+                SourceNode.repository_id == repo_id,
+                TargetNode.repository_id == repo_id,
+                ~GraphEdgeModel.target_id.startswith("ext:"),
+                ~GraphEdgeModel.source_id.startswith("ext:"),
+            )
+            .distinct()
+            .all()
+        )
+
+        in_degree_counts: Dict[str, int] = {}
+        incoming_calls_counts: Dict[str, int] = {}
+        out_degree_counts: Dict[str, int] = {}
+
+        for src, tgt, edge_type in valid_edges:
+            out_degree_counts[src] = out_degree_counts.get(src, 0) + 1
+            in_degree_counts[tgt] = in_degree_counts.get(tgt, 0) + 1
+            if edge_type == "CALLS":
+                incoming_calls_counts[tgt] = incoming_calls_counts.get(tgt, 0) + 1
+
+        # 2. Query candidate nodes in repository matching scope
+        node_query = self.db.query(GraphNodeModel).filter(
+            GraphNodeModel.repository_id == repo_id,
+        )
+        if scope == "file":
+            node_query = node_query.filter(GraphNodeModel.node_type == "FILE")
+        elif scope == "symbol":
+            node_query = node_query.filter(GraphNodeModel.node_type != "FILE")
+
+        candidate_nodes = node_query.all()
+
+        scored_items: List[GodNodeItem] = []
+        for node in candidate_nodes:
+            in_deg = in_degree_counts.get(node.id, 0)
+            out_deg = out_degree_counts.get(node.id, 0)
+            in_calls = incoming_calls_counts.get(node.id, 0)
+
+            score = (2.0 * in_deg) + (3.0 * in_calls) + (1.0 * out_deg)
+            # Exclude zero-score isolated nodes
+            if score <= 0.0:
+                continue
+
+            scored_items.append(
+                GodNodeItem(
+                    node=GraphNodeSchema.model_validate(node),
+                    god_score=round(score, 2),
+                    in_degree=in_deg,
+                    out_degree=out_deg,
+                    incoming_calls=in_calls,
+                )
+            )
+
+        # 3. Deterministic sorting:
+        # - score descending
+        # - incoming calls descending
+        # - in-degree descending
+        # - file path ascending (null-safe)
+        # - start line ascending (null-safe)
+        # - name ascending (null-safe)
+        # - node ID ascending (null-safe)
+        scored_items.sort(
+            key=lambda item: (
+                -item.god_score,
+                -item.incoming_calls,
+                -item.in_degree,
+                item.node.file_path or "",
+                item.node.start_line if item.node.start_line is not None else 0,
+                item.node.name or "",
+                item.node.id or "",
+            )
+        )
+
+        return scored_items[:limit]
+
 

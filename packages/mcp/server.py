@@ -320,6 +320,47 @@ def detect_import_cycles(repo_id: str) -> str:
             return json.dumps({"error": str(e)})
 
 
+@mcp_server.tool()
+def god_nodes(
+    repo_id: str,
+    limit: int = 20,
+    scope: str = "all",
+) -> str:
+    """Identifies architectural hub nodes (god nodes) with high connectivity and call centrality.
+
+    Args:
+        repo_id: Repository UUID.
+        limit: Maximum number of god nodes to return (default 20).
+        scope: Analysis scope filter - 'all' (files and symbols), 'file' (only FILE nodes), or 'symbol' (only non-file symbols).
+    """
+    with get_db_session() as db:
+        repo = db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            return json.dumps({"error": f"Repository '{repo_id}' not found"})
+        if scope not in ("all", "file", "symbol"):
+            return json.dumps({"error": f"Invalid scope '{scope}'. Must be 'all', 'file', or 'symbol'"})
+        if limit <= 0:
+            return json.dumps(
+                {
+                    "repository_id": repo_id,
+                    "scope": scope,
+                    "total_results": 0,
+                    "god_nodes": [],
+                },
+                indent=2,
+            )
+
+        engine = GraphQueryEngine(db)
+        results = engine.get_god_nodes(repo_id=repo_id, limit=limit, scope=scope)
+        payload = {
+            "repository_id": repo_id,
+            "scope": scope,
+            "total_results": len(results),
+            "god_nodes": [r.model_dump() for r in results],
+        }
+        return json.dumps(payload, indent=2, default=str)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ApexGraph MCP Server")
     parser.add_argument(
