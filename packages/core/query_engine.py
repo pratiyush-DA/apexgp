@@ -46,6 +46,10 @@ class GraphQueryEngine:
         file_path: Optional[str] = None,
     ) -> List[GraphNodeModel]:
         """Locates exact or qualified symbol definitions."""
+        name = name.strip() if name else ""
+        if not name:
+            return []
+
         query = self.db.query(GraphNodeModel).filter(
             or_(
                 GraphNodeModel.name == name,
@@ -84,6 +88,9 @@ class GraphQueryEngine:
             A deterministically sorted list of SearchResult objects ordered by match relevance,
             with ties broken by file path, start line, and qualified name.
         """
+        if limit <= 0:
+            return []
+
         if not query_text or not query_text.strip():
             return []
 
@@ -288,6 +295,10 @@ class GraphQueryEngine:
         self, node_id: str, max_depth: int = 5
     ) -> List[Dict[str, Any]]:
         """Finds callers traversing incoming CALLS edges up to max_depth."""
+        center_node = self.db.query(GraphNodeModel).filter_by(id=node_id).first()
+        if not center_node:
+            return []
+
         visited: Set[str] = {node_id}
         queue = deque([(node_id, 0, [])])
         callers: List[Dict[str, Any]] = []
@@ -300,6 +311,7 @@ class GraphQueryEngine:
             incoming = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == center_node.repository_id,
                     GraphEdgeModel.target_id == curr_id,
                     GraphEdgeModel.edge_type == "CALLS",
                 )
@@ -307,7 +319,11 @@ class GraphQueryEngine:
             )
 
             for edge in incoming:
-                caller_node = self.db.query(GraphNodeModel).filter_by(id=edge.source_id).first()
+                caller_node = (
+                    self.db.query(GraphNodeModel)
+                    .filter_by(id=edge.source_id, repository_id=center_node.repository_id)
+                    .first()
+                )
                 if not caller_node:
                     continue
 
@@ -340,6 +356,10 @@ class GraphQueryEngine:
         self, node_id: str, max_depth: int = 5
     ) -> List[Dict[str, Any]]:
         """Finds callees traversing outgoing CALLS edges up to max_depth."""
+        center_node = self.db.query(GraphNodeModel).filter_by(id=node_id).first()
+        if not center_node:
+            return []
+
         visited: Set[str] = {node_id}
         queue = deque([(node_id, 0, [])])
         callees: List[Dict[str, Any]] = []
@@ -352,6 +372,7 @@ class GraphQueryEngine:
             outgoing = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == center_node.repository_id,
                     GraphEdgeModel.source_id == curr_id,
                     GraphEdgeModel.edge_type == "CALLS",
                 )
@@ -359,7 +380,11 @@ class GraphQueryEngine:
             )
 
             for edge in outgoing:
-                callee_node = self.db.query(GraphNodeModel).filter_by(id=edge.target_id).first()
+                callee_node = (
+                    self.db.query(GraphNodeModel)
+                    .filter_by(id=edge.target_id, repository_id=center_node.repository_id)
+                    .first()
+                )
                 if not callee_node:
                     continue
 
@@ -390,9 +415,17 @@ class GraphQueryEngine:
 
     def get_dependencies(self, node_id: str) -> Dict[str, Any]:
         """Returns outgoing IMPORTS and REFERENCES edges for a node or file."""
+        source_node = self.db.query(GraphNodeModel).filter_by(id=node_id).first()
+        if not source_node:
+            return {
+                "internal_dependencies": [],
+                "external_dependencies": [],
+            }
+
         edges = (
             self.db.query(GraphEdgeModel)
             .filter(
+                GraphEdgeModel.repository_id == source_node.repository_id,
                 GraphEdgeModel.source_id == node_id,
                 GraphEdgeModel.edge_type.in_(["IMPORTS", "REFERENCES"]),
             )
@@ -406,7 +439,11 @@ class GraphQueryEngine:
             if e.target_id.startswith("ext:"):
                 external_deps.append({"id": e.target_id, "evidence": e.evidence})
             else:
-                target_node = self.db.query(GraphNodeModel).filter_by(id=e.target_id).first()
+                target_node = (
+                    self.db.query(GraphNodeModel)
+                    .filter_by(id=e.target_id, repository_id=source_node.repository_id)
+                    .first()
+                )
                 if target_node:
                     dep_nodes.append(
                         {
@@ -426,10 +463,21 @@ class GraphQueryEngine:
         self, source_id: str, target_id: str, max_depth: int = 6
     ) -> Optional[List[Dict[str, Any]]]:
         """Finds shortest path between two symbols using bidirectional BFS."""
-        if source_id == target_id:
-            node = self.db.query(GraphNodeModel).filter_by(id=source_id).first()
-            return [{"node_id": source_id, "name": node.name if node else source_id, "edge": None}]
+        source_node = self.db.query(GraphNodeModel).filter_by(id=source_id).first()
+        if not source_node:
+            return None
 
+        if source_id == target_id:
+            return [{"node_id": source_id, "name": source_node.name, "edge": None}]
+
+        target_node = self.db.query(GraphNodeModel).filter_by(id=target_id).first()
+        if not target_node and not target_id.startswith("ext:"):
+            return None
+
+        if target_node and target_node.repository_id != source_node.repository_id:
+            return None
+
+        repo_id = source_node.repository_id
         visited: Set[str] = {source_id}
         queue = deque([(source_id, [])])
 
@@ -438,10 +486,13 @@ class GraphQueryEngine:
             if len(path) >= max_depth:
                 continue
 
-            # Check outgoing and incoming edges for traversal
+            # Check outgoing and incoming edges for traversal, strictly scoped to repo_id
             edges = (
                 self.db.query(GraphEdgeModel)
-                .filter(or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id))
+                .filter(
+                    GraphEdgeModel.repository_id == repo_id,
+                    or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id),
+                )
                 .all()
             )
 
@@ -475,8 +526,12 @@ class GraphQueryEngine:
         max_depth: int = 5,
     ) -> ImpactAnalysisResult:
         """Calculates blast radius: affected symbols, files, and linked tests."""
-        # Check if target is a node_id, file_path, or symbol name
-        target_node = self.db.query(GraphNodeModel).filter_by(id=target_node_or_file).first()
+        # Check if target is a node_id, file_path, or symbol name (scoped to repo_id)
+        target_node = (
+            self.db.query(GraphNodeModel)
+            .filter_by(id=target_node_or_file, repository_id=repo_id)
+            .first()
+        )
 
         if not target_node:
             # Try file path lookup
@@ -520,6 +575,7 @@ class GraphQueryEngine:
             incoming_edges = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == repo_id,
                     GraphEdgeModel.target_id == curr_id,
                     GraphEdgeModel.edge_type.in_(["CALLS", "IMPORTS", "REFERENCES", "CONTAINS"]),
                 )
@@ -562,6 +618,7 @@ class GraphQueryEngine:
             test_edges = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == repo_id,
                     GraphEdgeModel.target_id == aff_id,
                     GraphEdgeModel.edge_type.in_(["TESTS", "CALLS"]),
                 )
@@ -600,6 +657,8 @@ class GraphQueryEngine:
             self.db.query(GraphNodeModel)
             .join(GraphEdgeModel, GraphEdgeModel.source_id == GraphNodeModel.id)
             .filter(
+                GraphEdgeModel.repository_id == target_node.repository_id,
+                GraphNodeModel.repository_id == target_node.repository_id,
                 GraphEdgeModel.target_id == node_id,
                 or_(
                     GraphEdgeModel.edge_type == "TESTS",
@@ -617,6 +676,8 @@ class GraphQueryEngine:
             self.db.query(GraphNodeModel)
             .join(GraphEdgeModel, GraphEdgeModel.source_id == GraphNodeModel.id)
             .filter(
+                GraphEdgeModel.repository_id == target_node.repository_id,
+                GraphNodeModel.repository_id == target_node.repository_id,
                 GraphEdgeModel.target_id == file_id,
                 or_(
                     GraphNodeModel.node_type == "TEST",
@@ -650,7 +711,10 @@ class GraphQueryEngine:
             # Outgoing & Incoming
             edges = (
                 self.db.query(GraphEdgeModel)
-                .filter(or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id))
+                .filter(
+                    GraphEdgeModel.repository_id == center_node.repository_id,
+                    or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id),
+                )
                 .limit(limit)
                 .all()
             )
@@ -663,7 +727,11 @@ class GraphQueryEngine:
                 next_id = e.target_id if e.source_id == curr_id else e.source_id
                 if next_id not in visited_nodes and not next_id.startswith("ext:"):
                     visited_nodes.add(next_id)
-                    next_node = self.db.query(GraphNodeModel).filter_by(id=next_id).first()
+                    next_node = (
+                        self.db.query(GraphNodeModel)
+                        .filter_by(id=next_id, repository_id=center_node.repository_id)
+                        .first()
+                    )
                     if next_node:
                         node_models[next_id] = next_node
                         queue.append((next_id, depth + 1))
