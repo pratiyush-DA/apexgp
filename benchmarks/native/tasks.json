@@ -1,0 +1,131 @@
+{
+  "benchmark_version": "1.0.0",
+  "description": "RepoPeekV3 Native Code Intelligence Benchmark Suite",
+  "fixture_repo_path": "tests/fixtures/sample_repo",
+  "tasks": [
+    {
+      "task_id": "T1_MULTI_TERM_SNAKE",
+      "category": "symbol_retrieval",
+      "difficulty": "leaf",
+      "description": "Find sum calculation utility for calculator engine using natural language space query",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "calculate sum",
+        "limit": 5
+      },
+      "expected_targets": [
+        {
+          "name": "calculate_sum",
+          "file_path": "calculator.py",
+          "node_type": "METHOD"
+        }
+      ],
+      "relevance_criterion": {
+        "min_rank": 1,
+        "min_score": 0.88
+      }
+    },
+    {
+      "task_id": "T2_POLYGLOT_SEARCH_CAMEL",
+      "category": "polyglot_retrieval",
+      "difficulty": "leaf",
+      "description": "Find TypeScript format result function using space-separated query",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "format result",
+        "limit": 5
+      },
+      "expected_targets": [
+        {
+          "name": "formatResult",
+          "file_path": "formatter.ts",
+          "node_type": "FUNCTION"
+        }
+      ],
+      "relevance_criterion": {
+        "min_rank": 1,
+        "min_score": 0.88
+      }
+    },
+    {
+      "task_id": "T3_CROSS_FIELD_SEARCH",
+      "category": "cross_field_retrieval",
+      "difficulty": "localized",
+      "description": "Locate math addition operator across file path and symbol name",
+      "query_type": "search_code",
+      "query_params": {
+        "query_text": "math add",
+        "limit": 5
+      },
+      "expected_targets": [
+        {
+          "name": "add",
+          "file_path": "math_ops.py",
+          "node_type": "FUNCTION"
+        }
+      ],
+      "relevance_criterion": {
+        "min_rank": 3,
+        "min_score": 0.70
+      }
+    },
+    {
+      "task_id": "T4_CHANGE_IMPACT_BLAST_RADIUS",
+      "category": "impact_analysis",
+      "difficulty": "subsystem",
+      "description": "Analyze change impact for 'add' operation across dependent files and linked tests",
+      "query_type": "analyze_change_impact",
+      "query_params": {
+        "target_node_or_file": "add",
+        "max_depth": 5
+      },
+      "expected_affected_files": [
+        "calculator.py"
+      ],
+      "expected_affected_symbols": [
+        "calculate_sum"
+      ],
+      "expected_linked_tests": [
+        "test_calculator_sum"
+      ],
+      "relevance_criterion": {
+        "require_all_files": true,
+        "require_all_tests": true
+      }
+    },
+    {
+      "task_id": "T5_TEST_DISCOVERY",
+      "category": "test_discovery",
+      "difficulty": "localized",
+      "description": "Discover linked tests covering the Calculator class",
+      "query_type": "find_related_tests",
+      "query_params": {
+        "symbol_name": "Calculator",
+        "file_path": "calculator.py"
+      },
+      "expected_test_names": [
+        "test_calculator_sum",
+        "test_calculator_product"
+      ],
+      "expected_test_files": [
+        "test_calculator.py"
+      ],
+      "relevance_criterion": {
+        "min_tests_found": 1
+      }
+    },
+    {
+      "task_id": "T6_IMPORT_CYCLE_DIAGNOSTICS",
+      "category": "architectural_health",
+      "difficulty": "diagnostic",
+      "description": "Audit repository dependency graph for cyclic import dependencies",
+      "query_type": "detect_import_cycles",
+      "query_params": {},
+      "expected_total_cycles": 0,
+      "expected_cycles": [],
+      "relevance_criterion": {
+        "must_be_acyclic": true
+      }
+    }
+  ]
+}

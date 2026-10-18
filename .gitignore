@@ -48,4 +48,9 @@ Thumbs.db
 # Evaluation, Testing, and Local Outputs
 output/
 testing/
-benchmarks/
+benchmarks/*
+!benchmarks/native/
+benchmarks/native/*
+!benchmarks/native/__init__.py
+!benchmarks/native/tasks.json
+!benchmarks/native/runner.py
