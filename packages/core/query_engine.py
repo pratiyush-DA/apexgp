@@ -26,6 +26,11 @@ STOP_WORDS = {
     "what", "where", "which", "with", "by", "from", "on", "at",
 }
 
+STRUCTURAL_KEYWORDS = {
+    "registry", "manager", "service", "factory", "handler",
+    "engine", "provider", "client", "controller", "repository",
+}
+
 
 def _tokenize_query_terms(text: str) -> List[str]:
     """Splits identifiers and query phrases on spaces, delimiters, and camelCase boundaries."""
@@ -35,6 +40,23 @@ def _tokenize_query_terms(text: str) -> List[str]:
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
     tokens = re.split(r"[^a-zA-Z0-9]+", s)
     return [t.lower() for t in tokens if t]
+
+
+def _terms_match(t1: str, t2: str) -> bool:
+    """Lightweight term matching with bidirectional prefix overlap and inflection stem matching."""
+    if t1 == t2:
+        return True
+    if len(t1) >= 3 and len(t2) >= 3:
+        if t1.startswith(t2) or t2.startswith(t1):
+            return True
+        # Inflection stem matching (e.g. registry vs registration -> 'regist', validator vs validation -> 'validat')
+        prefix_len = 0
+        min_len = min(len(t1), len(t2))
+        while prefix_len < min_len and t1[prefix_len] == t2[prefix_len]:
+            prefix_len += 1
+        if prefix_len >= 5 or (min_len <= 6 and prefix_len >= 4):
+            return True
+    return False
 
 
 class GraphQueryEngine:
@@ -107,6 +129,9 @@ class GraphQueryEngine:
         substantive_tokens = [t for t in query_tokens if t not in STOP_WORDS]
         eval_tokens = substantive_tokens if substantive_tokens else query_tokens
         num_eval = len(eval_tokens)
+        query_structural_terms = {
+            q for q in eval_tokens if any(_terms_match(q, kw) for kw in STRUCTURAL_KEYWORDS)
+        }
 
         query = self.db.query(GraphNodeModel)
 
@@ -177,7 +202,7 @@ class GraphQueryEngine:
                 name_matches = sum(
                     1
                     for q in eval_tokens
-                    if q in name_tokens or any(nt.startswith(q) for nt in name_tokens)
+                    if any(_terms_match(q, nt) for nt in name_tokens)
                 )
 
                 if name_matches == num_eval:
@@ -194,7 +219,7 @@ class GraphQueryEngine:
                     struct_matches = sum(
                         1
                         for q in eval_tokens
-                        if q in struct_tokens or any(st.startswith(q) for st in struct_tokens)
+                        if any(_terms_match(q, st) for st in struct_tokens)
                     )
 
                     if struct_matches == num_eval:
@@ -204,7 +229,7 @@ class GraphQueryEngine:
                         doc_matches = sum(
                             1
                             for q in eval_tokens
-                            if q in doc_tokens or any(dt.startswith(q) for dt in doc_tokens)
+                            if any(_terms_match(q, dt) for dt in doc_tokens)
                         )
                         if doc_matches == num_eval:
                             # All terms match docstring
@@ -221,19 +246,32 @@ class GraphQueryEngine:
                         else:
                             score = 0.20
 
+            # Context-aware structural boost (+0.14) for CLASS and INTERFACE containers
+            # when query explicitly seeks structural components (e.g. registry, engine, manager)
+            # and the node matches the structural concept.
+            if query_structural_terms and n.node_type in ("CLASS", "INTERFACE"):
+                node_structural = any(
+                    any(_terms_match(st_kw, nt) for nt in name_tokens)
+                    for st_kw in query_structural_terms
+                )
+                if node_structural and score >= 0.35:
+                    score = min(0.98, round(score + 0.14, 2))
+
             snippet = n.signature or n.docstring or f"{n.node_type} {n.name} ({n.file_path}:{n.start_line})"
             scored_results.append((score, n, snippet))
 
         # Deterministic ranking:
         # 1. Score descending (-score)
         # 2. Prefer functional symbols over FILE containers on symbol-directed queries
-        # 3. File path ascending
-        # 4. Start line ascending
-        # 5. Qualified name ascending
+        # 3. Prefer CLASS/INTERFACE when query explicitly seeks structural components
+        # 4. File path ascending
+        # 5. Start line ascending
+        # 6. Qualified name ascending
         scored_results.sort(
             key=lambda item: (
                 -item[0],
                 1 if (not is_file_query and item[1].node_type == "FILE") else 0,
+                0 if (query_structural_terms and item[1].node_type in ("CLASS", "INTERFACE")) else 1,
                 item[1].file_path,
                 item[1].start_line,
                 item[1].qualified_name,

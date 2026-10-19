@@ -1,0 +1,288 @@
+{
+  "benchmark_suite": "RepoPeekV3 Native Benchmark",
+  "benchmark_version": "1.0.0",
+  "git_commit": "b51429616787690605da9adb7901133038a8849d",
+  "timestamp": "2026-10-19T08:32:33Z",
+  "environment": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python_version": "3.10.0rc2",
+    "os": "Windows",
+    "machine": "AMD64"
+  },
+  "fixture": {
+    "source_path": "C:\\Users\\pkumar2\\OneDrive - Data Axle\\Documents\\AI_INIT\\RepopeekV3\\tests\\fixtures\\sample_repo",
+    "total_files": 5,
+    "total_nodes": 16,
+    "total_edges": 33,
+    "languages": {
+      "typescript": 2,
+      "python": 3
+    }
+  },
+  "aggregate_metrics": {
+    "total_tasks": 10,
+    "passed_tasks": 10,
+    "accuracy_rate": 1.0,
+    "indexing_duration_ms": 25.56,
+    "suite_execution_duration_ms": 239.59,
+    "mean_query_latency_ms": 3.473,
+    "retrieval": {
+      "task_count": 6,
+      "mean_hit_at_1": 1.0,
+      "mean_recall_at_3": 1.0,
+      "mean_recall_at_5": 1.0,
+      "mean_mrr": 1.0,
+      "negative_rejection_task_count": 1,
+      "negative_rejection_accuracy": 1.0
+    },
+    "graph_traversal": {
+      "impact_task_count": 1,
+      "mean_impact_file_recall": 1.0,
+      "mean_linked_test_recall": 1.0
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "T1_MULTI_TERM_SNAKE",
+      "category": "symbol_retrieval",
+      "difficulty": "leaf",
+      "description": "Find sum calculation utility for calculator engine using natural language space query",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": false,
+        "hit_at_1": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "top_rank": 1,
+        "retrieved_count": 3
+      },
+      "performance": {
+        "median_latency_ms": 2.017,
+        "p95_latency_ms": 3.128,
+        "repetitions": 5,
+        "payload_bytes": 1893,
+        "approx_tokens": 473
+      }
+    },
+    {
+      "task_id": "T2_POLYGLOT_SEARCH_CAMEL",
+      "category": "polyglot_retrieval",
+      "difficulty": "leaf",
+      "description": "Find TypeScript format result function using space-separated query",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": false,
+        "hit_at_1": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "top_rank": 1,
+        "retrieved_count": 3
+      },
+      "performance": {
+        "median_latency_ms": 1.841,
+        "p95_latency_ms": 3.175,
+        "repetitions": 5,
+        "payload_bytes": 1569,
+        "approx_tokens": 392
+      }
+    },
+    {
+      "task_id": "T3_CROSS_FIELD_SEARCH",
+      "category": "cross_field_retrieval",
+      "difficulty": "localized",
+      "description": "Locate math addition operator across file path and symbol name",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": false,
+        "hit_at_1": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "top_rank": 1,
+        "retrieved_count": 5
+      },
+      "performance": {
+        "median_latency_ms": 2.034,
+        "p95_latency_ms": 4.28,
+        "repetitions": 5,
+        "payload_bytes": 2888,
+        "approx_tokens": 722
+      }
+    },
+    {
+      "task_id": "T4_CHANGE_IMPACT_BLAST_RADIUS",
+      "category": "impact_analysis",
+      "difficulty": "subsystem",
+      "description": "Analyze change impact for 'add' operation across dependent files and linked tests",
+      "query_type": "analyze_change_impact",
+      "correct": true,
+      "metrics": {
+        "impact_file_recall": 1.0,
+        "linked_test_recall": 1.0,
+        "total_affected": 6,
+        "affected_files_count": 3,
+        "linked_tests_count": 2
+      },
+      "performance": {
+        "median_latency_ms": 17.121,
+        "p95_latency_ms": 19.111,
+        "repetitions": 5,
+        "payload_bytes": 7039,
+        "approx_tokens": 1760
+      }
+    },
+    {
+      "task_id": "T5_TEST_DISCOVERY",
+      "category": "test_discovery",
+      "difficulty": "localized",
+      "description": "Discover linked tests covering the Calculator class",
+      "query_type": "find_related_tests",
+      "correct": true,
+      "metrics": {
+        "test_recall": 1.0,
+        "found_tests_count": 2,
+        "found_test_names": [
+          "test_calculator_product",
+          "test_calculator_sum"
+        ]
+      },
+      "performance": {
+        "median_latency_ms": 1.803,
+        "p95_latency_ms": 2.357,
+        "repetitions": 5,
+        "payload_bytes": 140,
+        "approx_tokens": 35
+      }
+    },
+    {
+      "task_id": "T6_IMPORT_CYCLE_DIAGNOSTICS",
+      "category": "architectural_health",
+      "difficulty": "diagnostic",
+      "description": "Audit repository dependency graph for cyclic import dependencies",
+      "query_type": "detect_import_cycles",
+      "correct": true,
+      "metrics": {
+        "total_cycles": 0,
+        "is_acyclic": true,
+        "cycles": []
+      },
+      "performance": {
+        "median_latency_ms": 0.682,
+        "p95_latency_ms": 0.89,
+        "repetitions": 5,
+        "payload_bytes": 2,
+        "approx_tokens": 1
+      }
+    },
+    {
+      "task_id": "T7_QUALIFIED_IDENTIFIER",
+      "category": "qualified_retrieval",
+      "difficulty": "localized",
+      "description": "Find method by exact qualified identifier Calculator.calculate_sum",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": false,
+        "hit_at_1": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "top_rank": 1,
+        "retrieved_count": 5
+      },
+      "performance": {
+        "median_latency_ms": 2.525,
+        "p95_latency_ms": 5.679,
+        "repetitions": 5,
+        "payload_bytes": 3061,
+        "approx_tokens": 765
+      }
+    },
+    {
+      "task_id": "T8_SYMBOL_PRECEDENCE",
+      "category": "symbol_precedence",
+      "difficulty": "leaf",
+      "description": "Ensure functional symbol formatResult outranks container FILE node for symbol query 'format'",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": false,
+        "hit_at_1": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "top_rank": 1,
+        "retrieved_count": 3
+      },
+      "performance": {
+        "median_latency_ms": 1.443,
+        "p95_latency_ms": 2.624,
+        "repetitions": 5,
+        "payload_bytes": 1569,
+        "approx_tokens": 392
+      }
+    },
+    {
+      "task_id": "T9_NATURAL_QUERY_STOPWORDS",
+      "category": "natural_language",
+      "difficulty": "localized",
+      "description": "Find sum calculation utility using natural language query with stop words",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": false,
+        "hit_at_1": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "top_rank": 1,
+        "retrieved_count": 5
+      },
+      "performance": {
+        "median_latency_ms": 2.755,
+        "p95_latency_ms": 4.065,
+        "repetitions": 5,
+        "payload_bytes": 3060,
+        "approx_tokens": 765
+      }
+    },
+    {
+      "task_id": "T10_ZERO_DISTRACTOR_CLEAN",
+      "category": "distractor_rejection",
+      "difficulty": "diagnostic",
+      "description": "Precision check ensuring completely non-existent query returns zero distractor results",
+      "query_type": "search_code",
+      "correct": true,
+      "metrics": {
+        "is_zero_target": true,
+        "negative_rejection_success": 1.0,
+        "distractor_count": 0,
+        "retrieved_count": 0,
+        "hit_at_1": null,
+        "recall_at_1": null,
+        "recall_at_3": null,
+        "recall_at_5": null,
+        "mrr": null,
+        "top_rank": null
+      },
+      "performance": {
+        "median_latency_ms": 2.509,
+        "p95_latency_ms": 3.176,
+        "repetitions": 5,
+        "payload_bytes": 2,
+        "approx_tokens": 1
+      }
+    }
+  ]
+}

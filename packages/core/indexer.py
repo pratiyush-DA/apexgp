@@ -58,6 +58,8 @@ class RepositoryIndexer:
         self.db = db_session
         self.tsconfig_base_url = "."
         self.tsconfig_paths: Dict[str, List[str]] = {}
+        self.tsconfigs: Dict[str, Dict[str, Any]] = {}
+        self.tsconfigs_by_file: Dict[str, Dict[str, Any]] = {}
         self.go_module_name: Optional[str] = None
 
     def index_repository(self, repository_id: str) -> RepositoryModel:
@@ -72,7 +74,7 @@ class RepositoryIndexer:
             self.db.commit()
             return repo
 
-        self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+        self._discover_tsconfigs(repo_root)
         self.go_module_name = self._load_go_mod(repo_root)
 
         repo.indexing_status = "indexing"
@@ -694,6 +696,116 @@ class RepositoryIndexer:
             logger.error(f"Failed indexing repository {repository_id}: {e}", exc_info=True)
             raise
 
+    def _parse_single_tsconfig(
+        self, repo_root: str, full_path: str, rel_dir: str, rel_file: str
+    ) -> Optional[Dict[str, Any]]:
+        """Parses a single tsconfig.json file, extracting baseUrl, paths, and relative extends."""
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                raw_content = f.read()
+
+            # Remove single-line // comments and multi-line /* */ comments
+            cleaned = re.sub(r"//.*$", "", raw_content, flags=re.MULTILINE)
+            cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+            # Remove trailing commas before } or ]
+            cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+
+            data = json.loads(cleaned)
+            if not isinstance(data, dict):
+                return None
+
+            compiler_opts = data.get("compilerOptions", {})
+            if not isinstance(compiler_opts, dict):
+                compiler_opts = {}
+
+            has_explicit_base_url = "baseUrl" in compiler_opts
+            raw_base_url = compiler_opts.get("baseUrl")
+            if raw_base_url is not None:
+                base_url = os.path.normpath(os.path.join(rel_dir, str(raw_base_url))).replace("\\", "/")
+                if base_url == ".":
+                    base_url = ""
+            else:
+                base_url = rel_dir
+
+            paths = compiler_opts.get("paths", {})
+            normalized_paths: Dict[str, List[str]] = {}
+            if isinstance(paths, dict):
+                for k, v in paths.items():
+                    if isinstance(v, list):
+                        normalized_paths[k] = [str(item) for item in v]
+                    elif isinstance(v, str):
+                        normalized_paths[k] = [v]
+
+            def _pattern_precedence_key(pattern: str):
+                if "*" not in pattern:
+                    return (0, -len(pattern), 0)
+                prefix, *rest = pattern.split("*", 1)
+                suffix = rest[0] if rest else ""
+                return (1, -len(prefix), -len(suffix))
+
+            sorted_paths = dict(
+                sorted(normalized_paths.items(), key=lambda item: _pattern_precedence_key(item[0]))
+            )
+
+            extends_path = None
+            if "extends" in data and isinstance(data["extends"], str):
+                raw_ext = data["extends"].strip()
+                cand_ext = os.path.normpath(os.path.join(rel_dir, raw_ext)).replace("\\", "/")
+                if os.path.isfile(os.path.join(repo_root, cand_ext)):
+                    extends_path = cand_ext
+                elif os.path.isfile(os.path.join(repo_root, cand_ext + ".json")):
+                    extends_path = cand_ext + ".json"
+
+            return {
+                "config_path": rel_file,
+                "rel_dir": rel_dir,
+                "base_url": base_url,
+                "paths": sorted_paths,
+                "extends_path": extends_path,
+                "has_explicit_base_url": has_explicit_base_url,
+            }
+        except Exception as e:
+            logger.warning(f"Error reading tsconfig at {rel_file}: {e}")
+            return None
+
+    def _discover_tsconfigs(self, repo_root: str) -> None:
+        """Discovers and parses all tsconfig.json files across the repository,
+        handling nested subproject roots, relative extends, and path precedence."""
+        self.tsconfigs = {}
+        self.tsconfigs_by_file = {}
+
+        for root, dirs, files in os.walk(repo_root):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            for fname in files:
+                if fname == "tsconfig.json" or (fname.startswith("tsconfig.") and fname.endswith(".json")):
+                    full_path = os.path.join(root, fname)
+                    rel_file = os.path.relpath(full_path, repo_root).replace("\\", "/")
+                    rel_dir = os.path.dirname(rel_file).replace("\\", "/")
+                    if rel_dir == ".":
+                        rel_dir = ""
+
+                    cfg = self._parse_single_tsconfig(repo_root, full_path, rel_dir, rel_file)
+                    if cfg:
+                        self.tsconfigs_by_file[rel_file] = cfg
+                        if fname == "tsconfig.json" or rel_dir not in self.tsconfigs:
+                            self.tsconfigs[rel_dir] = cfg
+
+        # Resolve 1-level relative extends baseUrl inheritance
+        for rel_file, cfg in list(self.tsconfigs_by_file.items()):
+            ext_path = cfg.get("extends_path")
+            if ext_path and ext_path in self.tsconfigs_by_file:
+                parent_cfg = self.tsconfigs_by_file[ext_path]
+                if not cfg.get("has_explicit_base_url") and parent_cfg.get("has_explicit_base_url"):
+                    cfg["base_url"] = parent_cfg["base_url"]
+
+        # Populate legacy attributes for backward compatibility
+        if "" in self.tsconfigs:
+            self.tsconfig_base_url = self.tsconfigs[""]["base_url"] or "."
+            self.tsconfig_paths = self.tsconfigs[""]["paths"]
+        else:
+            self.tsconfig_base_url = "."
+            self.tsconfig_paths = {}
+
     def _load_tsconfig(self, repo_root: str) -> Tuple[str, Dict[str, List[str]]]:
         """Loads and parses tsconfig.json compilerOptions baseUrl and paths mappings."""
         tsconfig_path = os.path.join(repo_root, "tsconfig.json")
@@ -1110,68 +1222,108 @@ class RepositoryIndexer:
         # Check TypeScript path aliases (baseUrl and paths from tsconfig.json)
         # ONLY apply to TypeScript/JavaScript files.
         if is_ts_or_js:
-            if self.tsconfig_paths:
-                for pattern, target_list in self.tsconfig_paths.items():
-                    matched = False
-                    suffix = ""
-                    if "*" in pattern:
-                        prefix, *rest = pattern.split("*", 1)
-                        rest_suffix = rest[0] if rest else ""
-                        if import_path.startswith(prefix) and import_path.endswith(rest_suffix):
-                            if len(import_path) >= len(prefix) + len(rest_suffix):
-                                matched = True
-                                end_idx = len(import_path) - len(rest_suffix) if rest_suffix else len(import_path)
-                                suffix = import_path[len(prefix):end_idx]
-                    elif import_path == pattern:
-                        matched = True
+            chain = []
+            if hasattr(self, "tsconfigs") and self.tsconfigs:
+                cur_dir = os.path.dirname(base_file).replace("\\", "/")
+                test_dir = cur_dir
+                scoped_cfg = None
+                while True:
+                    if test_dir in self.tsconfigs:
+                        scoped_cfg = self.tsconfigs[test_dir]
+                        break
+                    if not test_dir or test_dir == ".":
+                        break
+                    parent = os.path.dirname(test_dir).replace("\\", "/")
+                    if parent == test_dir:
+                        break
+                    test_dir = parent
+                if scoped_cfg is None and "" in self.tsconfigs:
+                    scoped_cfg = self.tsconfigs[""]
+
+                visited = set()
+                curr = scoped_cfg
+                while curr and curr["config_path"] not in visited:
+                    visited.add(curr["config_path"])
+                    chain.append(curr)
+                    ext_path = curr.get("extends_path")
+                    if ext_path and ext_path in getattr(self, "tsconfigs_by_file", {}):
+                        curr = self.tsconfigs_by_file[ext_path]
+                    else:
+                        curr = None
+            elif self.tsconfig_paths:
+                chain = [{
+                    "config_path": "tsconfig.json",
+                    "rel_dir": "",
+                    "base_url": self.tsconfig_base_url if self.tsconfig_base_url != "." else "",
+                    "paths": self.tsconfig_paths,
+                    "has_explicit_base_url": bool(self.tsconfig_base_url and self.tsconfig_base_url != "."),
+                }]
+
+            for cfg in chain:
+                paths = cfg.get("paths", {})
+                base_url = cfg.get("base_url", "")
+                if paths:
+                    for pattern, target_list in paths.items():
+                        matched = False
                         suffix = ""
+                        if "*" in pattern:
+                            prefix, *rest = pattern.split("*", 1)
+                            rest_suffix = rest[0] if rest else ""
+                            if import_path.startswith(prefix) and import_path.endswith(rest_suffix):
+                                if len(import_path) >= len(prefix) + len(rest_suffix):
+                                    matched = True
+                                    end_idx = len(import_path) - len(rest_suffix) if rest_suffix else len(import_path)
+                                    suffix = import_path[len(prefix):end_idx]
+                        elif import_path == pattern:
+                            matched = True
+                            suffix = ""
 
-                    if matched:
-                        for target_pattern in target_list:
-                            if "*" in target_pattern:
-                                target_base = target_pattern.replace("*", suffix, 1)
-                            else:
-                                target_base = target_pattern
+                        if matched:
+                            for target_pattern in target_list:
+                                if "*" in target_pattern:
+                                    target_base = target_pattern.replace("*", suffix, 1)
+                                else:
+                                    target_base = target_pattern
 
-                            # Combine with base_url
-                            resolved_candidate = os.path.normpath(
-                                os.path.join(self.tsconfig_base_url, target_base)
-                            ).replace("\\", "/")
+                                # Combine with base_url
+                                resolved_candidate = os.path.normpath(
+                                    os.path.join(base_url, target_base) if base_url else target_base
+                                ).replace("\\", "/")
 
-                            alias_candidates = [
-                                resolved_candidate,
-                                f"{resolved_candidate}.ts",
-                                f"{resolved_candidate}.tsx",
-                                f"{resolved_candidate}.js",
-                                f"{resolved_candidate}.jsx",
-                                f"{resolved_candidate}/index.ts",
-                                f"{resolved_candidate}/index.tsx",
-                                f"{resolved_candidate}/index.js",
-                                f"{resolved_candidate}/index.jsx",
-                            ]
-                            for cand in alias_candidates:
-                                if cand in known_files:
-                                    return cand
+                                alias_candidates = [
+                                    resolved_candidate,
+                                    f"{resolved_candidate}.ts",
+                                    f"{resolved_candidate}.tsx",
+                                    f"{resolved_candidate}.js",
+                                    f"{resolved_candidate}.jsx",
+                                    f"{resolved_candidate}/index.ts",
+                                    f"{resolved_candidate}/index.tsx",
+                                    f"{resolved_candidate}/index.js",
+                                    f"{resolved_candidate}/index.jsx",
+                                ]
+                                for cand in alias_candidates:
+                                    if cand in known_files:
+                                        return cand
 
-            # If baseUrl is specified and not '.', also try resolving relative to baseUrl
-            if self.tsconfig_base_url and self.tsconfig_base_url != ".":
-                base_candidate = os.path.normpath(
-                    os.path.join(self.tsconfig_base_url, import_path)
-                ).replace("\\", "/")
-                alias_candidates = [
-                    base_candidate,
-                    f"{base_candidate}.ts",
-                    f"{base_candidate}.tsx",
-                    f"{base_candidate}.js",
-                    f"{base_candidate}.jsx",
-                    f"{base_candidate}/index.ts",
-                    f"{base_candidate}/index.tsx",
-                    f"{base_candidate}/index.js",
-                    f"{base_candidate}/index.jsx",
-                ]
-                for cand in alias_candidates:
-                    if cand in known_files:
-                        return cand
+                # If baseUrl is specified and not '.', also try resolving relative to baseUrl
+                if cfg.get("has_explicit_base_url") and base_url and base_url != ".":
+                    base_candidate = os.path.normpath(
+                        os.path.join(base_url, import_path)
+                    ).replace("\\", "/")
+                    alias_candidates = [
+                        base_candidate,
+                        f"{base_candidate}.ts",
+                        f"{base_candidate}.tsx",
+                        f"{base_candidate}.js",
+                        f"{base_candidate}.jsx",
+                        f"{base_candidate}/index.ts",
+                        f"{base_candidate}/index.tsx",
+                        f"{base_candidate}/index.js",
+                        f"{base_candidate}/index.jsx",
+                    ]
+                    for cand in alias_candidates:
+                        if cand in known_files:
+                            return cand
 
         # Handle Python module dot notation (e.g. core.math -> core/math.py)
         # Strictly limited to Python files so TS/JS non-relative imports (e.g. express)
@@ -1920,8 +2072,9 @@ class RepositoryIndexer:
         rel_path = rel_path.replace("\\", "/")
         full_path = os.path.join(repo_root, rel_path)
 
-        if not self.tsconfig_paths and os.path.exists(repo_root):
-            self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+        is_tsconfig_file = os.path.basename(rel_path) == "tsconfig.json" or rel_path.endswith(".tsconfig.json")
+        if (not self.tsconfigs or is_tsconfig_file) and os.path.exists(repo_root):
+            self._discover_tsconfigs(repo_root)
         if self.go_module_name is None and os.path.exists(repo_root):
             self.go_module_name = self._load_go_mod(repo_root)
 
@@ -2101,8 +2254,8 @@ class RepositoryIndexer:
         if not os.path.exists(repo_root) or not os.path.isdir(repo_root):
             raise ValueError(f"Repository path '{repo.source_path}' does not exist or is not a directory.")
 
-        if not self.tsconfig_paths:
-            self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+        if not self.tsconfigs and os.path.exists(repo_root):
+            self._discover_tsconfigs(repo_root)
         if self.go_module_name is None:
             self.go_module_name = self._load_go_mod(repo_root)
 
