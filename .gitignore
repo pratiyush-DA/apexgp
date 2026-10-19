@@ -54,3 +54,7 @@ benchmarks/native/*
 !benchmarks/native/__init__.py
 !benchmarks/native/tasks.json
 !benchmarks/native/runner.py
+
+# Scratch & Benchmark Local Outputs
+scratch/
+output_*/
