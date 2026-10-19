@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "apexgraph"
 version = "1.0.0"
-description = "Independent Code Knowledge Graph & Developer Intelligence Platform"
+description = "Independent Code Knowledge Graph and Developer Intelligence Platform"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -41,8 +41,12 @@ dev = [
 apexgp = "packages.mcp.server:main"
 apexgraph = "packages.mcp.server:main"
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apps*", "packages*"]
+exclude = ["tests*", "data*", "Workflow_Documentation*", "output_benchmark_*", "benchmarks*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 pythonpath = ["."]
-
