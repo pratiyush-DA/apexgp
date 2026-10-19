@@ -11,6 +11,7 @@ import tree_sitter_javascript
 import tree_sitter_typescript
 
 from packages.core.parsers.base import (
+    BaseParser,
     ExtractedCall,
     ExtractedImport,
     ExtractedNode,
@@ -19,7 +20,7 @@ from packages.core.parsers.base import (
 )
 
 
-class TypeScriptJavaScriptParser:
+class TypeScriptJavaScriptParser(BaseParser):
     def __init__(self):
         self.ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
         self.tsx_lang = tree_sitter.Language(tree_sitter_typescript.language_tsx())

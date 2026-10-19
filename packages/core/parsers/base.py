@@ -1,8 +1,18 @@
 """Base Data Structures and Interfaces for AST Parsers
 """
 
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
+
+
+class BaseParser(ABC):
+    """Abstract base class for all AST parsers in RepoPeek."""
+
+    @abstractmethod
+    def parse_code(self, code: str, file_path: str = "") -> "ParseResult":
+        """Parses source code into a standardized ParseResult."""
+        pass
 
 
 class ExtractedNode(BaseModel):

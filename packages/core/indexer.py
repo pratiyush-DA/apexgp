@@ -20,7 +20,13 @@ from packages.core.models import (
     GraphNodeModel,
     RepositoryModel,
 )
-from packages.core.parsers import is_supported_file, parse_source_file
+from packages.core.parsers import (
+    are_languages_call_compatible,
+    default_registry,
+    get_runtime_prefix,
+    is_supported_file,
+    parse_source_file,
+)
 from packages.core.parsers.base import ExtractedNode, ParseResult
 
 logger = logging.getLogger("apexgraph.indexer")
@@ -44,18 +50,7 @@ IGNORE_DIRS = {
 
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_BYTES", 2 * 1024 * 1024))  # 2MB
 
-LANGUAGE_FAMILIES: Dict[str, str] = {
-    "python": "python",
-    "typescript": "js_ts",
-    "javascript": "js_ts",
-}
-
-
-def are_languages_call_compatible(lang_a: str, lang_b: str) -> bool:
-    """Checks if two languages belong to the same execution runtime family for in-process AST calls."""
-    fam_a = LANGUAGE_FAMILIES.get(lang_a, lang_a)
-    fam_b = LANGUAGE_FAMILIES.get(lang_b, lang_b)
-    return fam_a == fam_b
+LANGUAGE_FAMILIES: Dict[str, str] = default_registry.get_language_families()
 
 
 class RepositoryIndexer:
@@ -63,6 +58,7 @@ class RepositoryIndexer:
         self.db = db_session
         self.tsconfig_base_url = "."
         self.tsconfig_paths: Dict[str, List[str]] = {}
+        self.go_module_name: Optional[str] = None
 
     def index_repository(self, repository_id: str) -> RepositoryModel:
         repo = self.db.query(RepositoryModel).filter_by(id=repository_id).first()
@@ -77,6 +73,7 @@ class RepositoryIndexer:
             return repo
 
         self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+        self.go_module_name = self._load_go_mod(repo_root)
 
         repo.indexing_status = "indexing"
         repo.error_message = None
@@ -171,7 +168,7 @@ class RepositoryIndexer:
                 file_nodes_by_path[rel_path] = file_node
 
                 # B. Create symbol nodes inside file
-                runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+                runtime_prefix = get_runtime_prefix(parse_res.language)
                 for ex_node in parse_res.nodes:
                     node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
                     db_node = GraphNodeModel(
@@ -240,7 +237,7 @@ class RepositoryIndexer:
             # A. DEFINES and CONTAINS edges
             for rel_path, parse_res in all_parse_results.items():
                 file_id = f"{repository_id}:file:{rel_path}"
-                runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+                runtime_prefix = get_runtime_prefix(parse_res.language)
                 for ex_node in parse_res.nodes:
                     node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
                     # File defines symbol
@@ -268,12 +265,27 @@ class RepositoryIndexer:
                                 confidence=1.0,
                                 evidence=f"{enclosing} contains {ex_node.name}",
                             )
+                        elif default_registry.is_package_scoped(parse_res.language):
+                            # In package-scoped languages, struct may be in another file in the same package directory
+                            rel_dir = os.path.dirname(rel_path)
+                            for cand in symbol_table.get(enclosing, []):
+                                if default_registry.is_package_scoped(cand.language) and cand.node_type == "CLASS" and os.path.dirname(cand.file_path) == rel_dir:
+                                    add_edge(
+                                        source_id=cand.id,
+                                        target_id=node_id,
+                                        edge_type="CONTAINS",
+                                        file_path=rel_path,
+                                        line_no=ex_node.start_line,
+                                        confidence=1.0,
+                                        evidence=f"{enclosing} contains {ex_node.name}",
+                                    )
+                                    break
 
             # B. IMPORTS edges (including re-exports)
             file_imported_symbols: Dict[str, Dict[str, GraphNodeModel]] = {}
             for rel_path, parse_res in all_parse_results.items():
                 file_id = f"{repository_id}:file:{rel_path}"
-                runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+                runtime_prefix = get_runtime_prefix(parse_res.language)
 
                 for imp in parse_res.imports:
                     target_file_path = self._resolve_import_path(
@@ -297,65 +309,118 @@ class RepositoryIndexer:
 
                         # Link imported specific symbols
                         target_parse_res = all_parse_results.get(target_file_path)
-                        target_runtime_prefix = (
-                            "py"
-                            if target_parse_res and target_parse_res.language == "python"
-                            else ("ts" if target_parse_res and target_parse_res.language == "typescript" else "js")
-                        )
-                        for sym in imp.imported_symbols:
-                            if sym == "*":
-                                continue
-                            target_sym_id = f"{repository_id}:{target_runtime_prefix}:{target_file_path}:{sym}"
-                            if target_sym_id in nodes_by_id:
-                                tgt_node = nodes_by_id[target_sym_id]
-                                if rel_path not in file_imported_symbols:
-                                    file_imported_symbols[rel_path] = {}
-                                file_imported_symbols[rel_path][sym] = tgt_node
-                                if imp.alias:
-                                    file_imported_symbols[rel_path][imp.alias] = tgt_node
-                                add_edge(
-                                    source_id=file_id,
-                                    target_id=target_sym_id,
-                                    edge_type="REFERENCES",
-                                    file_path=rel_path,
-                                    line_no=imp.line_number,
-                                    confidence=1.0,
-                                    evidence=f"import {sym} from {imp.module_path}",
-                                )
-                            else:
-                                # Check if target_file_path re-exports sym (barrel re-export)
-                                resolved_origin = self._resolve_symbol_origin(
-                                    current_file=target_file_path,
-                                    symbol_name=sym,
-                                    all_parse_results=all_parse_results,
-                                    nodes_by_id=nodes_by_id,
-                                    repository_id=repository_id,
-                                )
-                                if resolved_origin:
-                                    origin_file, origin_sym = resolved_origin
-                                    origin_res = all_parse_results.get(origin_file)
-                                    origin_prefix = (
-                                        "py"
-                                        if origin_res and origin_res.language == "python"
-                                        else ("ts" if origin_res and origin_res.language == "typescript" else "js")
-                                    )
-                                    origin_node_id = f"{repository_id}:{origin_prefix}:{origin_file}:{origin_sym}"
-                                    if origin_node_id in nodes_by_id:
-                                        tgt_node = nodes_by_id[origin_node_id]
+                        target_runtime_prefix = get_runtime_prefix(target_parse_res.language if target_parse_res else "")
+
+                        if default_registry.is_package_scoped(parse_res.language):
+                            # In package-scoped languages, importing a package exposes its exported symbols
+                            target_dir = os.path.dirname(target_file_path)
+                            target_files = [
+                                f for f in all_parse_results.keys()
+                                if (os.path.dirname(f) == target_dir or (target_dir == "" and os.path.dirname(f) == ""))
+                                and f.endswith(".go")
+                                and not f.endswith("_test.go")
+                            ]
+                            pkg_alias = imp.alias or (os.path.basename(target_dir) if target_dir else "main")
+                            if rel_path not in file_imported_symbols:
+                                file_imported_symbols[rel_path] = {}
+                            for t_file in target_files:
+                                t_res = all_parse_results.get(t_file)
+                                if not t_res:
+                                    continue
+                                for ex_n in t_res.nodes:
+                                    if ex_n.metadata.get("exported") or (ex_n.name and ex_n.name[0].isupper()):
+                                        t_sym_id = f"{repository_id}:go:{t_file}:{ex_n.qualified_name}"
+                                        if t_sym_id in nodes_by_id:
+                                            tgt_node = nodes_by_id[t_sym_id]
+                                            file_imported_symbols[rel_path][f"{pkg_alias}.{ex_n.name}"] = tgt_node
+                                            if imp.alias == ".":
+                                                file_imported_symbols[rel_path][ex_n.name] = tgt_node
+                                            add_edge(
+                                                source_id=file_id,
+                                                target_id=t_sym_id,
+                                                edge_type="REFERENCES",
+                                                file_path=rel_path,
+                                                line_no=imp.line_number,
+                                                confidence=1.0,
+                                                evidence=f"import {pkg_alias}.{ex_n.name} from {imp.module_path}",
+                                            )
+                        else:
+                            for sym in imp.imported_symbols:
+                                if sym == "*":
+                                    if target_parse_res:
                                         if rel_path not in file_imported_symbols:
                                             file_imported_symbols[rel_path] = {}
-                                        file_imported_symbols[rel_path][sym] = tgt_node
-                                        if imp.alias:
-                                            file_imported_symbols[rel_path][imp.alias] = tgt_node
-                                        add_edge(
-                                            source_id=file_id,
-                                            target_id=origin_node_id,
-                                            edge_type="REFERENCES",
-                                            file_path=rel_path,
-                                            line_no=imp.line_number,
-                                            confidence=1.0,
-                                            evidence=f"import {sym} from {imp.module_path} (re-exported from {origin_file})",
-                                        )
+                                        for ex_n in target_parse_res.nodes:
+                                            if ex_n.node_type in ("FUNCTION", "VARIABLE", "CLASS", "TYPE"):
+                                                t_sym_id = f"{repository_id}:{target_runtime_prefix}:{target_file_path}:{ex_n.qualified_name}"
+                                                if t_sym_id in nodes_by_id:
+                                                    tgt_node = nodes_by_id[t_sym_id]
+                                                    if ex_n.name not in file_imported_symbols[rel_path]:
+                                                        file_imported_symbols[rel_path][ex_n.name] = tgt_node
+                                                    add_edge(
+                                                        source_id=file_id,
+                                                        target_id=t_sym_id,
+                                                        edge_type="REFERENCES",
+                                                        file_path=rel_path,
+                                                        line_no=imp.line_number,
+                                                        confidence=0.8,
+                                                        evidence=f"{imp.raw_statement} (wildcard import)",
+                                                    )
+                                    continue
+                                target_sym_id = f"{repository_id}:{target_runtime_prefix}:{target_file_path}:{sym}"
+                                if target_sym_id not in nodes_by_id and target_parse_res:
+                                    for ex_n in target_parse_res.nodes:
+                                        if ex_n.name == sym:
+                                            cand_id = f"{repository_id}:{target_runtime_prefix}:{target_file_path}:{ex_n.qualified_name}"
+                                            if cand_id in nodes_by_id:
+                                                target_sym_id = cand_id
+                                                break
+                                if target_sym_id in nodes_by_id:
+                                    tgt_node = nodes_by_id[target_sym_id]
+                                    if rel_path not in file_imported_symbols:
+                                        file_imported_symbols[rel_path] = {}
+                                    file_imported_symbols[rel_path][sym] = tgt_node
+                                    if imp.alias:
+                                        file_imported_symbols[rel_path][imp.alias] = tgt_node
+                                    add_edge(
+                                        source_id=file_id,
+                                        target_id=target_sym_id,
+                                        edge_type="REFERENCES",
+                                        file_path=rel_path,
+                                        line_no=imp.line_number,
+                                        confidence=1.0,
+                                        evidence=f"import {sym} from {imp.module_path}",
+                                    )
+                                else:
+                                    # Check if target_file_path re-exports sym (barrel re-export)
+                                    resolved_origin = self._resolve_symbol_origin(
+                                        current_file=target_file_path,
+                                        symbol_name=sym,
+                                        all_parse_results=all_parse_results,
+                                        nodes_by_id=nodes_by_id,
+                                        repository_id=repository_id,
+                                    )
+                                    if resolved_origin:
+                                        origin_file, origin_sym = resolved_origin
+                                        origin_res = all_parse_results.get(origin_file)
+                                        origin_prefix = get_runtime_prefix(origin_res.language if origin_res else "")
+                                        origin_node_id = f"{repository_id}:{origin_prefix}:{origin_file}:{origin_sym}"
+                                        if origin_node_id in nodes_by_id:
+                                            tgt_node = nodes_by_id[origin_node_id]
+                                            if rel_path not in file_imported_symbols:
+                                                file_imported_symbols[rel_path] = {}
+                                            file_imported_symbols[rel_path][sym] = tgt_node
+                                            if imp.alias:
+                                                file_imported_symbols[rel_path][imp.alias] = tgt_node
+                                            add_edge(
+                                                source_id=file_id,
+                                                target_id=origin_node_id,
+                                                edge_type="REFERENCES",
+                                                file_path=rel_path,
+                                                line_no=imp.line_number,
+                                                confidence=1.0,
+                                                evidence=f"import {sym} from {imp.module_path} (re-exported from {origin_file})",
+                                            )
                     else:
                         # External package import (e.g. npm:react or py:sys)
                         external_id = f"ext:{runtime_prefix}:{imp.module_path}"
@@ -445,7 +510,7 @@ class RepositoryIndexer:
 
             # C. CALLS and TESTS edges
             for rel_path, parse_res in all_parse_results.items():
-                runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+                runtime_prefix = get_runtime_prefix(parse_res.language)
                 for call in parse_res.calls:
                     caller_id = (
                         f"{repository_id}:{runtime_prefix}:{rel_path}:{call.caller_name}"
@@ -462,17 +527,11 @@ class RepositoryIndexer:
                         target_candidate = imported_syms[call.callee_name]
                     else:
                         raw_candidates = symbol_table.get(call.callee_name, [])
-                        if not raw_candidates:
-                            continue
-
-                        # Filter candidates to only those compatible with caller's language family
                         callee_candidates = [
                             cand
                             for cand in raw_candidates
                             if are_languages_call_compatible(parse_res.language, cand.language)
                         ]
-                        if not callee_candidates:
-                            continue
 
                         # Prioritize candidate from same file or imported file (direct or via barrel)
                         for cand in callee_candidates:
@@ -480,12 +539,50 @@ class RepositoryIndexer:
                                 target_candidate = cand
                                 break
 
+                        # In package-scoped languages, files in the same directory share package scope
+                        if not target_candidate and default_registry.is_package_scoped(parse_res.language):
+                            rel_dir = os.path.dirname(rel_path)
+                            for cand in callee_candidates:
+                                if os.path.dirname(cand.file_path) == rel_dir:
+                                    target_candidate = cand
+                                    break
+
                         if not target_candidate:
                             file_reachable = reachable_imports.get(rel_path, set())
                             for cand in callee_candidates:
                                 if cand.file_path in file_reachable:
                                     target_candidate = cand
                                     break
+
+                        # Handle method selector and path calls like "c.AddToTotal", "calc.Add", "math::add", "Person::new"
+                        if not target_candidate and ("." in call.callee_name or "::" in call.callee_name):
+                            simple_name = call.callee_name.split("::")[-1].split(".")[-1]
+                            method_candidates = [
+                                cand
+                                for cand in symbol_table.get(simple_name, [])
+                                if are_languages_call_compatible(parse_res.language, cand.language)
+                            ]
+                            for cand in method_candidates:
+                                if cand.file_path == rel_path:
+                                    target_candidate = cand
+                                    break
+                            if not target_candidate and default_registry.is_package_scoped(parse_res.language):
+                                rel_dir = os.path.dirname(rel_path)
+                                for cand in method_candidates:
+                                    if os.path.dirname(cand.file_path) == rel_dir or cand.file_path in reachable_imports.get(rel_path, set()):
+                                        target_candidate = cand
+                                        break
+                            if not target_candidate:
+                                file_reachable = reachable_imports.get(rel_path, set())
+                                for cand in method_candidates:
+                                    if cand.file_path in file_reachable:
+                                        if cand.node_metadata and cand.node_metadata.get("trait"):
+                                            target_candidate = cand
+                                            break
+                                        if not target_candidate:
+                                            target_candidate = cand
+                            if not target_candidate and len(method_candidates) == 1:
+                                target_candidate = method_candidates[0]
 
                         # Fallback to single candidate match (heuristic)
                         if not target_candidate and len(callee_candidates) == 1:
@@ -502,6 +599,17 @@ class RepositoryIndexer:
                             confidence=conf,
                             evidence=call.raw_call,
                         )
+
+                        if parse_res.language == "sql" and target_candidate.node_type in ("CLASS", "TYPE", "VARIABLE"):
+                            add_edge(
+                                source_id=caller_id,
+                                target_id=target_candidate.id,
+                                edge_type="REFERENCES",
+                                file_path=rel_path,
+                                line_no=call.line_number,
+                                confidence=conf,
+                                evidence=call.raw_call,
+                            )
 
                         # If caller is a TEST node, create explicit TESTS relationship
                         caller_node = nodes_by_id.get(caller_id)
@@ -638,6 +746,23 @@ class RepositoryIndexer:
             logger.warning(f"Error reading tsconfig.json: {e}")
             return ".", {}
 
+    def _load_go_mod(self, repo_root: str) -> Optional[str]:
+        """Loads and extracts the module path from go.mod if present."""
+        go_mod_path = os.path.join(repo_root, "go.mod")
+        if not os.path.exists(go_mod_path) or not os.path.isfile(go_mod_path):
+            return None
+        try:
+            with open(go_mod_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("module "):
+                        parts = line.split(None, 1)
+                        if len(parts) > 1:
+                            return parts[1].strip().strip('"\'')
+        except Exception as e:
+            logger.warning(f"Error reading go.mod: {e}")
+        return None
+
     def _resolve_symbol_origin(
         self,
         current_file: str,
@@ -672,7 +797,7 @@ class RepositoryIndexer:
         if not parse_res:
             return None
 
-        runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+        runtime_prefix = get_runtime_prefix(parse_res.language)
         direct_node_id = f"{repository_id}:{runtime_prefix}:{current_file}:{symbol_name}"
         if nodes_by_id and direct_node_id in nodes_by_id:
             return (current_file, symbol_name)
@@ -742,8 +867,189 @@ class RepositoryIndexer:
                 base_language = "typescript"
             elif ext in (".js", ".jsx", ".mjs", ".cjs"):
                 base_language = "javascript"
+            elif ext == ".go":
+                base_language = "go"
+            elif ext == ".rs":
+                base_language = "rust"
+            elif ext == ".sql":
+                base_language = "sql"
+            elif ext in (".sh", ".bash", ".zsh"):
+                base_language = "shell"
+            elif ext == ".json":
+                base_language = "json"
+            elif ext in (".yaml", ".yml"):
+                base_language = "yaml"
 
         is_python = base_language == "python"
+        is_go = base_language == "go"
+        is_rust = base_language == "rust"
+        is_sql = base_language == "sql"
+        is_shell = base_language in ("shell", "bash", "sh")
+        is_json = base_language == "json"
+        is_yaml = base_language in ("yaml", "yml")
+
+        if is_yaml:
+            clean_path = import_path.strip().strip("'\"")
+            if "#" in clean_path:
+                clean_path = clean_path.split("#")[0].strip()
+
+            rel_candidate = os.path.normpath(os.path.join(base_dir, clean_path)).replace("\\", "/")
+            if rel_candidate in known_files:
+                return rel_candidate
+
+            root_candidate = os.path.normpath(clean_path).replace("\\", "/")
+            if root_candidate in known_files:
+                return root_candidate
+
+            if not any(clean_path.endswith(ext) for ext in (".yaml", ".yml", ".json")):
+                for ext in (".yaml", ".yml", ".json"):
+                    cand1 = f"{rel_candidate}{ext}"
+                    if cand1 in known_files:
+                        return cand1
+                    cand2 = f"{root_candidate}{ext}"
+                    if cand2 in known_files:
+                        return cand2
+
+            base_name = os.path.basename(clean_path)
+            for kf in known_files:
+                if any(kf.endswith(ext) for ext in (".yaml", ".yml", ".json")):
+                    if os.path.basename(kf) == base_name or os.path.splitext(os.path.basename(kf))[0] == base_name:
+                        return kf
+            return None
+
+        if is_json:
+            clean_path = import_path.strip().strip("'\"")
+            if "#" in clean_path:
+                clean_path = clean_path.split("#")[0].strip()
+
+            rel_candidate = os.path.normpath(os.path.join(base_dir, clean_path)).replace("\\", "/")
+            if rel_candidate in known_files:
+                return rel_candidate
+
+            root_candidate = os.path.normpath(clean_path).replace("\\", "/")
+            if root_candidate in known_files:
+                return root_candidate
+
+            if not clean_path.endswith(".json"):
+                cand1 = f"{rel_candidate}.json"
+                if cand1 in known_files:
+                    return cand1
+                cand2 = f"{root_candidate}.json"
+                if cand2 in known_files:
+                    return cand2
+
+            base_name = os.path.basename(clean_path)
+            for kf in known_files:
+                if os.path.basename(kf) == base_name and kf.endswith(".json"):
+                    return kf
+            return None
+
+        if is_shell:
+            clean_path = import_path.strip().strip("'\"")
+            # If path contains variable like "$DIR/lib.sh" or "${SCRIPT_DIR}/lib.sh", strip variable prefix
+            if "$" in clean_path:
+                cleaned_var = clean_path.split("/")[-1]
+            else:
+                cleaned_var = clean_path
+
+            # 1. Direct relative candidate from base_dir
+            rel_candidate = os.path.normpath(os.path.join(base_dir, clean_path)).replace("\\", "/")
+            if rel_candidate in known_files:
+                return rel_candidate
+
+            # 2. Repo-root candidate
+            root_candidate = os.path.normpath(clean_path).replace("\\", "/")
+            if root_candidate in known_files:
+                return root_candidate
+
+            # 3. Cleaned variable candidate from base_dir
+            if cleaned_var != clean_path:
+                rel_var_cand = os.path.normpath(os.path.join(base_dir, cleaned_var)).replace("\\", "/")
+                if rel_var_cand in known_files:
+                    return rel_var_cand
+
+            # 4. Check extension candidates if omitted
+            for e in (".sh", ".bash", ".zsh"):
+                cand1 = f"{rel_candidate}{e}"
+                if cand1 in known_files:
+                    return cand1
+                cand2 = f"{root_candidate}{e}"
+                if cand2 in known_files:
+                    return cand2
+
+            # 5. Basename fallback among known shell scripts
+            base_name = os.path.basename(cleaned_var)
+            for kf in known_files:
+                if os.path.basename(kf) == base_name and any(kf.endswith(sh_ext) for sh_ext in (".sh", ".bash", ".zsh")):
+                    return kf
+            return None
+
+        if is_sql:
+            clean_path = import_path.strip().strip("'\"")
+            if not clean_path.endswith(".sql"):
+                clean_path = f"{clean_path}.sql"
+            rel_candidate = os.path.normpath(os.path.join(base_dir, clean_path)).replace("\\", "/")
+            if rel_candidate in known_files:
+                return rel_candidate
+            root_candidate = os.path.normpath(clean_path).replace("\\", "/")
+            if root_candidate in known_files:
+                return root_candidate
+            base_name = os.path.basename(clean_path)
+            for kf in known_files:
+                if os.path.basename(kf) == base_name and kf.endswith(".sql"):
+                    return kf
+            return None
+
+        if is_rust:
+            return self._resolve_rust_import_path(base_file, import_path, known_files)
+
+        if is_go:
+            # 1. Handle relative imports: ./util, ../math
+            if import_path.startswith("."):
+                joined = os.path.normpath(os.path.join(base_dir, import_path)).replace("\\", "/")
+                matching = [
+                    f for f in known_files
+                    if os.path.dirname(f) == joined and f.endswith(".go") and not f.endswith("_test.go")
+                ]
+                if matching:
+                    return sorted(matching)[0]
+
+            # 2. Handle module path imports via go.mod: e.g. "github.com/myorg/myrepo/pkg/math"
+            target_dir = None
+            if self.go_module_name:
+                if import_path == self.go_module_name:
+                    target_dir = "."
+                elif import_path.startswith(self.go_module_name + "/"):
+                    target_dir = import_path[len(self.go_module_name) + 1:].strip("/")
+
+            # 3. Direct subdirectory match (e.g. "pkg/math") if no go.mod prefix matched
+            if target_dir is None and not import_path.startswith("."):
+                norm_p = os.path.normpath(import_path).replace("\\", "/")
+                matching = [
+                    f for f in known_files
+                    if (os.path.dirname(f) == norm_p or (norm_p == "." and os.path.dirname(f) == ""))
+                    and f.endswith(".go")
+                    and not f.endswith("_test.go")
+                ]
+                if matching:
+                    return sorted(matching)[0]
+
+            if target_dir is not None:
+                norm_target = os.path.normpath(target_dir).replace("\\", "/")
+                matching = [
+                    f for f in known_files
+                    if (os.path.dirname(f) == norm_target or (norm_target == "." and os.path.dirname(f) == ""))
+                    and f.endswith(".go")
+                    and not f.endswith("_test.go")
+                ]
+                if matching:
+                    pkg_base = os.path.basename(norm_target) if norm_target != "." else "main"
+                    for m in matching:
+                        if os.path.basename(m) == f"{pkg_base}.go":
+                            return m
+                    return sorted(matching)[0]
+
+            return None
 
         # Handle relative imports: ./util, ../math
         if import_path.startswith("."):
@@ -772,7 +1078,7 @@ class RepositoryIndexer:
 
         # Check TypeScript path aliases (baseUrl and paths from tsconfig.json)
         # ONLY apply to TypeScript/JavaScript files.
-        if not is_python:
+        if not is_python and not is_go and not is_rust and not is_sql and not is_shell and not is_json:
             if self.tsconfig_paths:
                 for pattern, target_list in self.tsconfig_paths.items():
                     matched = False
@@ -853,6 +1159,89 @@ class RepositoryIndexer:
                 ])
             for cand in candidates:
                 if cand in known_files:
+                    return cand
+
+        return None
+
+    def _resolve_rust_import_path(
+        self,
+        base_file: str,
+        import_path: str,
+        known_files: Set[str],
+    ) -> Optional[str]:
+        """Resolves Rust crate::, self::, super::, and module imports to file paths."""
+        norm_base = base_file.replace("\\", "/")
+        base_dir = os.path.dirname(norm_base)
+
+        if norm_base.startswith("src/") or norm_base == "src":
+            crate_root = "src"
+        elif any(f.startswith("src/") for f in known_files):
+            crate_root = "src"
+        else:
+            crate_root = ""
+
+        clean_path = import_path.replace("/", "::")
+        parts = [p for p in clean_path.split("::") if p]
+        if not parts:
+            return None
+
+        first = parts[0]
+        subparts = parts[1:]
+
+        candidate_bases: List[str] = []
+
+        if first == "crate":
+            root = crate_root
+            if not subparts:
+                for cand in [f"{root}/lib.rs", f"{root}/main.rs", "lib.rs", "main.rs"]:
+                    c = cand.strip("/")
+                    if c in known_files:
+                        return c
+                return None
+            subpath = "/".join(subparts)
+            candidate_bases.append(f"{root}/{subpath}".strip("/"))
+        elif first == "self":
+            subpath = "/".join(subparts)
+            candidate_bases.append(
+                os.path.normpath(os.path.join(base_dir, subpath)).replace("\\", "/")
+            )
+        elif first == "super":
+            curr = base_dir
+            idx = 0
+            while idx < len(parts) and parts[idx] == "super":
+                curr = os.path.dirname(curr)
+                idx += 1
+            rem = "/".join(parts[idx:])
+            candidate_bases.append(
+                os.path.normpath(os.path.join(curr, rem)).replace("\\", "/")
+            )
+        else:
+            full_sub = "/".join(parts)
+            candidate_bases.append(
+                os.path.normpath(os.path.join(base_dir, full_sub)).replace("\\", "/")
+            )
+            if crate_root:
+                candidate_bases.append(f"{crate_root}/{full_sub}".strip("/"))
+            base_stem = os.path.splitext(os.path.basename(norm_base))[0]
+            if base_stem not in ("mod", "main", "lib"):
+                candidate_bases.append(
+                    os.path.normpath(os.path.join(base_dir, base_stem, full_sub)).replace("\\", "/")
+                )
+
+        for cand_base in candidate_bases:
+            cand_base = cand_base.strip("/")
+            for cand in [
+                cand_base,
+                f"{cand_base}.rs",
+                f"{cand_base}/mod.rs",
+            ]:
+                if cand in known_files:
+                    return cand
+
+            parent_cand = os.path.dirname(cand_base)
+            for cand in [f"{parent_cand}.rs", f"{parent_cand}/mod.rs"]:
+                cand = cand.strip("/")
+                if cand in known_files and cand != norm_base:
                     return cand
 
         return None
@@ -978,7 +1367,7 @@ class RepositoryIndexer:
     ) -> List[GraphEdgeModel]:
         """Constructs all outgoing edges for a single parsed file against the repository graph."""
         file_id = f"{repository_id}:file:{rel_path}"
-        runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+        runtime_prefix = get_runtime_prefix(parse_res.language)
 
         local_nodes = (
             self.db.query(GraphNodeModel)
@@ -1040,14 +1429,38 @@ class RepositoryIndexer:
             enclosing = ex_node.metadata.get("enclosing")
             if enclosing:
                 parent_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{enclosing}"
-                add_edge(
-                    source_id=parent_id,
-                    target_id=node_id,
-                    edge_type="CONTAINS",
-                    line_no=ex_node.start_line,
-                    confidence=1.0,
-                    evidence=f"{enclosing} contains {ex_node.name}",
-                )
+                if parent_id in local_nodes_by_id:
+                    add_edge(
+                        source_id=parent_id,
+                        target_id=node_id,
+                        edge_type="CONTAINS",
+                        line_no=ex_node.start_line,
+                        confidence=1.0,
+                        evidence=f"{enclosing} contains {ex_node.name}",
+                    )
+                elif default_registry.is_package_scoped(parse_res.language):
+                    rel_dir = os.path.dirname(rel_path)
+                    cand_structs = (
+                        self.db.query(GraphNodeModel)
+                        .filter(
+                            GraphNodeModel.repository_id == repository_id,
+                            GraphNodeModel.name == enclosing,
+                            GraphNodeModel.language == parse_res.language,
+                            GraphNodeModel.node_type == "CLASS",
+                        )
+                        .all()
+                    )
+                    for cand in cand_structs:
+                        if os.path.dirname(cand.file_path) == rel_dir:
+                            add_edge(
+                                source_id=cand.id,
+                                target_id=node_id,
+                                edge_type="CONTAINS",
+                                line_no=ex_node.start_line,
+                                confidence=1.0,
+                                evidence=f"{enclosing} contains {ex_node.name}",
+                            )
+                            break
 
         # 2. IMPORTS and REFERENCES edges
         file_imported_symbols: Dict[str, GraphNodeModel] = {}
@@ -1063,7 +1476,13 @@ class RepositoryIndexer:
                     )
                     .all()
                 )
-                target_nodes_cache[tgt_f] = {n.name: n for n in t_nodes if n.node_type != "FILE"}
+                m = {}
+                for n in t_nodes:
+                    if n.node_type != "FILE":
+                        m[n.name] = n
+                        if ":" in n.qualified_name:
+                            m[n.qualified_name.split(":", 1)[-1]] = n
+                target_nodes_cache[tgt_f] = m
             return target_nodes_cache[tgt_f]
 
         for imp in parse_res.imports:
@@ -1084,48 +1503,85 @@ class RepositoryIndexer:
                     evidence=imp.raw_statement,
                 )
 
-                t_syms = _get_target_file_nodes(target_file_path)
-                for sym in imp.imported_symbols:
-                    if sym == "*":
-                        continue
-                    if sym in t_syms:
-                        tgt_node = t_syms[sym]
-                        file_imported_symbols[sym] = tgt_node
-                        if imp.alias:
-                            file_imported_symbols[imp.alias] = tgt_node
-                        add_edge(
-                            source_id=file_id,
-                            target_id=tgt_node.id,
-                            edge_type="REFERENCES",
-                            line_no=imp.line_number,
-                            confidence=1.0,
-                            evidence=f"import {sym} from {imp.module_path}",
-                        )
-                    else:
-                        resolved_origin = self._resolve_symbol_origin(
-                            current_file=target_file_path,
-                            symbol_name=sym,
-                            all_parse_results={rel_path: parse_res},
-                            nodes_by_id=None,
-                            repository_id=repository_id,
-                            repo_root=repo_root,
-                        )
-                        if resolved_origin:
-                            origin_file, origin_sym = resolved_origin
-                            o_syms = _get_target_file_nodes(origin_file)
-                            if origin_sym in o_syms:
-                                origin_node = o_syms[origin_sym]
-                                file_imported_symbols[sym] = origin_node
-                                if imp.alias:
-                                    file_imported_symbols[imp.alias] = origin_node
+                if default_registry.is_package_scoped(parse_res.language):
+                    target_dir = os.path.dirname(target_file_path)
+                    target_files = [
+                        f for f in known_files
+                        if (os.path.dirname(f) == target_dir or (target_dir == "" and os.path.dirname(f) == ""))
+                        and f.endswith(".go")
+                        and not f.endswith("_test.go")
+                    ]
+                    pkg_alias = imp.alias or (os.path.basename(target_dir) if target_dir else "main")
+                    for t_file in target_files:
+                        t_syms = _get_target_file_nodes(t_file)
+                        for s_name, tgt_node in t_syms.items():
+                            meta = tgt_node.node_metadata if isinstance(tgt_node.node_metadata, dict) else {}
+                            if meta.get("exported") or (tgt_node.name and tgt_node.name[0].isupper()):
+                                file_imported_symbols[f"{pkg_alias}.{tgt_node.name}"] = tgt_node
+                                if imp.alias == ".":
+                                    file_imported_symbols[tgt_node.name] = tgt_node
                                 add_edge(
                                     source_id=file_id,
-                                    target_id=origin_node.id,
+                                    target_id=tgt_node.id,
                                     edge_type="REFERENCES",
                                     line_no=imp.line_number,
                                     confidence=1.0,
-                                    evidence=f"import {sym} from {imp.module_path} (re-exported from {origin_file})",
+                                    evidence=f"import {pkg_alias}.{tgt_node.name} from {imp.module_path}",
                                 )
+                else:
+                    t_syms = _get_target_file_nodes(target_file_path)
+                    for sym in imp.imported_symbols:
+                        if sym == "*":
+                            for s_name, tgt_node in t_syms.items():
+                                if s_name not in file_imported_symbols:
+                                    file_imported_symbols[s_name] = tgt_node
+                                add_edge(
+                                    source_id=file_id,
+                                    target_id=tgt_node.id,
+                                    edge_type="REFERENCES",
+                                    line_no=imp.line_number,
+                                    confidence=0.8,
+                                    evidence=f"{imp.raw_statement} (wildcard import)",
+                                )
+                            continue
+                        if sym in t_syms:
+                            tgt_node = t_syms[sym]
+                            file_imported_symbols[sym] = tgt_node
+                            if imp.alias:
+                                file_imported_symbols[imp.alias] = tgt_node
+                            add_edge(
+                                source_id=file_id,
+                                target_id=tgt_node.id,
+                                edge_type="REFERENCES",
+                                line_no=imp.line_number,
+                                confidence=1.0,
+                                evidence=f"import {sym} from {imp.module_path}",
+                            )
+                        else:
+                            resolved_origin = self._resolve_symbol_origin(
+                                current_file=target_file_path,
+                                symbol_name=sym,
+                                all_parse_results={rel_path: parse_res},
+                                nodes_by_id=None,
+                                repository_id=repository_id,
+                                repo_root=repo_root,
+                            )
+                            if resolved_origin:
+                                origin_file, origin_sym = resolved_origin
+                                o_syms = _get_target_file_nodes(origin_file)
+                                if origin_sym in o_syms:
+                                    origin_node = o_syms[origin_sym]
+                                    file_imported_symbols[sym] = origin_node
+                                    if imp.alias:
+                                        file_imported_symbols[imp.alias] = origin_node
+                                    add_edge(
+                                        source_id=file_id,
+                                        target_id=origin_node.id,
+                                        edge_type="REFERENCES",
+                                        line_no=imp.line_number,
+                                        confidence=1.0,
+                                        evidence=f"import {sym} from {imp.module_path} (re-exported from {origin_file})",
+                                    )
             else:
                 external_id = f"ext:{runtime_prefix}:{imp.module_path}"
                 add_edge(
@@ -1247,12 +1703,54 @@ class RepositoryIndexer:
                     if are_languages_call_compatible(parse_res.language, cand.language)
                 ]
                 if callee_candidates:
-                    for cand in callee_candidates:
-                        if cand.file_path in reachable_imports:
-                            target_candidate = cand
-                            break
+                    # In Go, files in the same directory share package scope
+                    if parse_res.language == "go":
+                        rel_dir = os.path.dirname(rel_path)
+                        for cand in callee_candidates:
+                            if os.path.dirname(cand.file_path) == rel_dir:
+                                target_candidate = cand
+                                break
+                    if not target_candidate:
+                        for cand in callee_candidates:
+                            if cand.file_path in reachable_imports:
+                                target_candidate = cand
+                                break
                     if not target_candidate and len(callee_candidates) == 1:
                         target_candidate = callee_candidates[0]
+
+                # Handle method selector and path calls like "c.AddToTotal", "calc.Add", "math::add", "Person::new"
+                if not target_candidate and ("." in call.callee_name or "::" in call.callee_name):
+                    simple_name = call.callee_name.split("::")[-1].split(".")[-1]
+                    raw_method_cands = (
+                        self.db.query(GraphNodeModel)
+                        .filter(
+                            GraphNodeModel.repository_id == repository_id,
+                            GraphNodeModel.name == simple_name,
+                            GraphNodeModel.node_type != "FILE",
+                        )
+                        .all()
+                    )
+                    method_candidates = [
+                        cand for cand in raw_method_cands
+                        if are_languages_call_compatible(parse_res.language, cand.language)
+                    ]
+                    for cand in method_candidates:
+                        if cand.file_path == rel_path:
+                            target_candidate = cand
+                            break
+                    if not target_candidate and default_registry.is_package_scoped(parse_res.language):
+                        rel_dir = os.path.dirname(rel_path)
+                        for cand in method_candidates:
+                            if os.path.dirname(cand.file_path) == rel_dir or cand.file_path in reachable_imports:
+                                target_candidate = cand
+                                break
+                    if not target_candidate:
+                        for cand in method_candidates:
+                            if cand.file_path in reachable_imports:
+                                target_candidate = cand
+                                break
+                    if not target_candidate and len(method_candidates) == 1:
+                        target_candidate = method_candidates[0]
 
             if target_candidate:
                 conf = 1.0 if target_candidate.file_path == rel_path else 0.85
@@ -1264,6 +1762,16 @@ class RepositoryIndexer:
                     confidence=conf,
                     evidence=call.raw_call,
                 )
+
+                if parse_res.language == "sql" and target_candidate.node_type in ("CLASS", "TYPE", "VARIABLE"):
+                    add_edge(
+                        source_id=caller_id,
+                        target_id=target_candidate.id,
+                        edge_type="REFERENCES",
+                        line_no=call.line_number,
+                        confidence=conf,
+                        evidence=call.raw_call,
+                    )
 
                 caller_node = local_nodes_by_id.get(caller_id) or self.db.query(GraphNodeModel).filter_by(id=caller_id, repository_id=repository_id).first()
                 if caller_node and caller_node.node_type == "TEST":
@@ -1387,6 +1895,8 @@ class RepositoryIndexer:
 
         if not self.tsconfig_paths and os.path.exists(repo_root):
             self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+        if self.go_module_name is None and os.path.exists(repo_root):
+            self.go_module_name = self._load_go_mod(repo_root)
 
         # Pre-query direct importers
         importer_rows = (
@@ -1399,6 +1909,21 @@ class RepositoryIndexer:
             .all()
         )
         direct_importers = {r[0] for r in importer_rows if r[0] != rel_path}
+        if default_registry.is_package_scoped(rel_path):
+            rel_dir = os.path.dirname(rel_path)
+            co_pkg_rows = (
+                self.db.query(GraphNodeModel.file_path)
+                .filter(
+                    GraphNodeModel.repository_id == repository_id,
+                    GraphNodeModel.node_type == "FILE",
+                    GraphNodeModel.language == "go",
+                )
+                .all()
+            )
+            for r in co_pkg_rows:
+                f_path = r[0]
+                if f_path != rel_path and os.path.dirname(f_path) == rel_dir:
+                    direct_importers.add(f_path)
 
         # Case A: File deleted on disk
         if not os.path.exists(full_path):
@@ -1465,7 +1990,7 @@ class RepositoryIndexer:
                 },
             )
             nodes_to_insert = [file_node]
-            runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+            runtime_prefix = get_runtime_prefix(parse_res.language)
             for ex_node in parse_res.nodes:
                 node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
                 db_node = GraphNodeModel(
@@ -1551,6 +2076,8 @@ class RepositoryIndexer:
 
         if not self.tsconfig_paths:
             self.tsconfig_base_url, self.tsconfig_paths = self._load_tsconfig(repo_root)
+        if self.go_module_name is None:
+            self.go_module_name = self._load_go_mod(repo_root)
 
         # 1. Scan disk for supported files
         disk_files: Dict[str, str] = {}
@@ -1682,6 +2209,12 @@ class RepositoryIndexer:
             .all()
         )
         direct_importers = {r[0] for r in dependent_file_query if r[0] not in all_changed_files}
+        for p in all_changed_files:
+            if default_registry.is_package_scoped(p):
+                p_dir = os.path.dirname(p)
+                for f_path in (disk_paths | db_paths):
+                    if default_registry.is_package_scoped(f_path) and f_path not in all_changed_files and os.path.dirname(f_path) == p_dir:
+                        direct_importers.add(f_path)
 
         # 7. Apply DB mutations atomically
         try:
@@ -1720,7 +2253,7 @@ class RepositoryIndexer:
                 )
                 new_nodes.append(file_node)
 
-                runtime_prefix = "py" if parse_res.language == "python" else ("ts" if parse_res.language == "typescript" else "js")
+                runtime_prefix = get_runtime_prefix(parse_res.language)
                 for ex_node in parse_res.nodes:
                     node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
                     db_node = GraphNodeModel(
