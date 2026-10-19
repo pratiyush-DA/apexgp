@@ -1,35 +1,55 @@
 """ApexGraph Parser Registry and Dispatcher
 """
 
-import os
-from typing import Optional
-from packages.core.parsers.base import ParseResult
+from packages.core.parsers.base import (
+    BaseParser,
+    ExtractedCall,
+    ExtractedImport,
+    ExtractedNode,
+    ExtractedReExport,
+    ParseResult,
+)
+from packages.core.parsers.registry import (
+    LanguageRegistry,
+    LanguageSpec,
+    are_languages_call_compatible,
+    default_registry,
+    get_runtime_prefix,
+    is_supported_file,
+    parse_source_file,
+)
+from packages.core.parsers.go_parser import GoParser
+from packages.core.parsers.json_parser import JsonParser
 from packages.core.parsers.python_parser import PythonParser
+from packages.core.parsers.rust_parser import RustParser
+from packages.core.parsers.shell_parser import ShellParser
+from packages.core.parsers.sql_parser import SQLParser
 from packages.core.parsers.ts_js_parser import TypeScriptJavaScriptParser
+from packages.core.parsers.yaml_parser import YamlParser
 
-_python_parser = PythonParser()
-_ts_js_parser = TypeScriptJavaScriptParser()
+SUPPORTED_EXTENSIONS = default_registry.get_supported_extensions()
 
-SUPPORTED_EXTENSIONS = {
-    ".py": "python",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-}
-
-
-def is_supported_file(file_path: str) -> bool:
-    ext = os.path.splitext(file_path)[1].lower()
-    return ext in SUPPORTED_EXTENSIONS
-
-
-def parse_source_file(file_path: str, code: str) -> Optional[ParseResult]:
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".py":
-        return _python_parser.parse_code(code, file_path=file_path)
-    elif ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
-        return _ts_js_parser.parse_code(code, file_path=file_path)
-    return None
+__all__ = [
+    "BaseParser",
+    "ExtractedCall",
+    "ExtractedImport",
+    "ExtractedNode",
+    "ExtractedReExport",
+    "ParseResult",
+    "LanguageRegistry",
+    "LanguageSpec",
+    "default_registry",
+    "is_supported_file",
+    "parse_source_file",
+    "get_runtime_prefix",
+    "are_languages_call_compatible",
+    "SUPPORTED_EXTENSIONS",
+    "GoParser",
+    "JsonParser",
+    "PythonParser",
+    "RustParser",
+    "ShellParser",
+    "SQLParser",
+    "TypeScriptJavaScriptParser",
+    "YamlParser",
+]

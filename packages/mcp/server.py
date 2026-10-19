@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
 
 from mcp.server.mcpserver import MCPServer
 from packages.core.database import get_db_session, init_db
+from packages.core.indexer import RepositoryIndexer
 from packages.core.models import RepositoryModel, WorkspaceModel
 from packages.core.query_engine import GraphQueryEngine
 
@@ -289,6 +290,92 @@ def get_graph_neighborhood(node_id: str, radius: int = 1, limit: int = 50) -> st
         engine = GraphQueryEngine(db)
         neighborhood = engine.get_graph_neighborhood(node_id=node_id, radius=radius, limit=limit)
         return json.dumps(neighborhood, indent=2)
+
+
+@mcp_server.tool()
+def detect_import_cycles(repo_id: str) -> str:
+    """Detects cyclic import dependencies across internal files in a repository.
+    
+    Returns cyclic strongly connected components (groups of files where each file
+    directly or transitively depends on all others in the group, or self-loops).
+    
+    Args:
+        repo_id: Repository UUID.
+    """
+    with get_db_session() as db:
+        repo = db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            return json.dumps({"error": f"Repository '{repo_id}' not found"})
+        engine = GraphQueryEngine(db)
+        try:
+            cycles = engine.detect_import_cycles(repo_id=repo_id)
+            return json.dumps(
+                {
+                    "repository_id": repo_id,
+                    "cyclic_components": cycles,
+                    "total_cyclic_components": len(cycles),
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+
+@mcp_server.tool()
+def god_nodes(
+    repo_id: str,
+    limit: int = 20,
+    scope: str = "all",
+) -> str:
+    """Identifies architectural hub nodes (god nodes) with high connectivity and call centrality.
+
+    Args:
+        repo_id: Repository UUID.
+        limit: Maximum number of god nodes to return (default 20).
+        scope: Analysis scope filter - 'all' (files and symbols), 'file' (only FILE nodes), or 'symbol' (only non-file symbols).
+    """
+    with get_db_session() as db:
+        repo = db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            return json.dumps({"error": f"Repository '{repo_id}' not found"})
+        if scope not in ("all", "file", "symbol"):
+            return json.dumps({"error": f"Invalid scope '{scope}'. Must be 'all', 'file', or 'symbol'"})
+        if limit <= 0:
+            return json.dumps(
+                {
+                    "repository_id": repo_id,
+                    "scope": scope,
+                    "total_results": 0,
+                    "god_nodes": [],
+                },
+                indent=2,
+            )
+
+        engine = GraphQueryEngine(db)
+        results = engine.get_god_nodes(repo_id=repo_id, limit=limit, scope=scope)
+        payload = {
+            "repository_id": repo_id,
+            "scope": scope,
+            "total_results": len(results),
+            "god_nodes": [r.model_dump() for r in results],
+        }
+        return json.dumps(payload, indent=2, default=str)
+
+
+@mcp_server.tool()
+def sync_repository(repo_id: str) -> str:
+    """Incrementally synchronizes a repository with disk, updating modified, added, or deleted files.
+    
+    Args:
+        repo_id: The UUID of the repository to synchronize.
+    """
+    with get_db_session() as db:
+        repo = db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            return json.dumps({"error": f"Repository '{repo_id}' not found"})
+        indexer = RepositoryIndexer(db)
+        sync_result = indexer.sync_repository(repo_id)
+        return json.dumps(sync_result, indent=2, default=str)
 
 
 def main():

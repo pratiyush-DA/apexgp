@@ -5,17 +5,36 @@ blast-radius calculations, and test discovery with evidence.
 """
 
 from collections import deque
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
-from sqlalchemy import or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy import case, or_, text
+from sqlalchemy.orm import Session, aliased
 
 from packages.core.models import (
+    GodNodeItem,
     GraphEdgeModel,
     GraphNodeModel,
     GraphNodeSchema,
     ImpactAnalysisResult,
+    RepositoryModel,
     SearchResult,
 )
+
+
+STOP_WORDS = {
+    "how", "to", "the", "in", "of", "a", "an", "is", "for", "and", "or",
+    "what", "where", "which", "with", "by", "from", "on", "at",
+}
+
+
+def _tokenize_query_terms(text: str) -> List[str]:
+    """Splits identifiers and query phrases on spaces, delimiters, and camelCase boundaries."""
+    if not text:
+        return []
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    tokens = re.split(r"[^a-zA-Z0-9]+", s)
+    return [t.lower() for t in tokens if t]
 
 
 class GraphQueryEngine:
@@ -29,6 +48,10 @@ class GraphQueryEngine:
         file_path: Optional[str] = None,
     ) -> List[GraphNodeModel]:
         """Locates exact or qualified symbol definitions."""
+        name = name.strip() if name else ""
+        if not name:
+            return []
+
         query = self.db.query(GraphNodeModel).filter(
             or_(
                 GraphNodeModel.name == name,
@@ -51,8 +74,40 @@ class GraphQueryEngine:
         file_path_filter: Optional[str] = None,
         limit: int = 50,
     ) -> List[SearchResult]:
-        """Performs lexical and structural code search across symbols and files."""
-        q = query_text.strip().lower()
+        """Performs multi-term tokenized and structural code search across symbols and files.
+
+        Handles natural language space-separated queries, snake_case, camelCase, and
+        exact identifiers, ranking results by structural relevance and term coverage.
+
+        Args:
+            query_text: The search query string.
+            repo_id: Optional repository UUID to scope search.
+            node_type: Optional node category filter (FUNCTION, METHOD, CLASS, etc.).
+            file_path_filter: Optional substring filter on file path.
+            limit: Maximum number of search results to return (default 50).
+
+        Returns:
+            A deterministically sorted list of SearchResult objects ordered by match relevance,
+            with ties broken by file path, start line, and qualified name.
+        """
+        if limit <= 0:
+            return []
+
+        if not query_text or not query_text.strip():
+            return []
+
+        q_clean = query_text.strip()
+        q_lower = q_clean.lower()
+        query_tokens = _tokenize_query_terms(q_clean)
+
+        if not query_tokens:
+            return []
+
+        is_file_query = bool(re.search(r"\.[a-zA-Z0-9]+$", q_clean) or "/" in q_clean or "\\" in q_clean)
+        substantive_tokens = [t for t in query_tokens if t not in STOP_WORDS]
+        eval_tokens = substantive_tokens if substantive_tokens else query_tokens
+        num_eval = len(eval_tokens)
+
         query = self.db.query(GraphNodeModel)
 
         if repo_id:
@@ -62,31 +117,131 @@ class GraphQueryEngine:
         if file_path_filter:
             query = query.filter(GraphNodeModel.file_path.ilike(f"%{file_path_filter}%"))
 
-        # Match by name, qualified_name, or docstring
-        query = query.filter(
-            or_(
-                GraphNodeModel.name.ilike(f"%{q}%"),
-                GraphNodeModel.qualified_name.ilike(f"%{q}%"),
-                GraphNodeModel.file_path.ilike(f"%{q}%"),
-                GraphNodeModel.docstring.ilike(f"%{q}%"),
+        # Build candidate filter: match any term or exact substring
+        term_clauses = [
+            GraphNodeModel.name.ilike(f"%{q_lower}%"),
+            GraphNodeModel.qualified_name.ilike(f"%{q_lower}%"),
+            GraphNodeModel.file_path.ilike(f"%{q_lower}%"),
+            GraphNodeModel.docstring.ilike(f"%{q_lower}%"),
+        ]
+        for tok in query_tokens:
+            term_clauses.append(GraphNodeModel.name.ilike(f"%{tok}%"))
+            term_clauses.append(GraphNodeModel.qualified_name.ilike(f"%{tok}%"))
+            term_clauses.append(GraphNodeModel.file_path.ilike(f"%{tok}%"))
+            term_clauses.append(GraphNodeModel.docstring.ilike(f"%{tok}%"))
+
+        query = query.filter(or_(*term_clauses))
+
+        # Prioritize candidate selection at database level to protect against truncation
+        query = query.order_by(
+            case(
+                (GraphNodeModel.name.ilike(q_lower), 0),
+                (GraphNodeModel.name.ilike(f"%{q_lower}%"), 1),
+                (GraphNodeModel.qualified_name.ilike(f"%{q_lower}%"), 2),
+                else_=3,
             )
         )
 
-        nodes = query.limit(limit).all()
-        results: List[SearchResult] = []
-        for n in nodes:
-            # Score relevance
+        # Retrieve candidates with headroom for scoring and deduplication
+        candidate_limit = max(limit * 5, 100)
+        candidates = query.limit(candidate_limit).all()
+
+        if not candidates:
+            return []
+
+        num_query = len(query_tokens)
+        scored_results: List[Tuple[float, GraphNodeModel, str]] = []
+
+        for n in candidates:
             name_lower = n.name.lower()
-            if name_lower == q:
+            qual_lower = n.qualified_name.lower()
+            qual_simple = qual_lower.split(":")[-1]
+            name_tokens = _tokenize_query_terms(n.name)
+            qual_tokens = _tokenize_query_terms(n.qualified_name)
+            file_tokens = _tokenize_query_terms(n.file_path)
+            doc_tokens = _tokenize_query_terms(n.docstring)
+
+            # 1. Exact match on simple symbol name
+            if name_lower == q_lower:
                 score = 1.0
-            elif name_lower.startswith(q):
-                score = 0.85
-            elif q in name_lower:
-                score = 0.7
+            # 2. Exact match on qualified symbol name (e.g. Calculator.calculate_sum)
+            elif qual_lower == q_lower or qual_simple == q_lower:
+                score = 0.98
+            # 3. Exact token equality on full query (e.g. "calculate sum" == ["calculate", "sum"])
+            elif query_tokens == name_tokens:
+                score = 0.95
+            # 4. Exact token equality on substantive tokens (when stop words present, e.g. "how to calculate sum")
+            elif substantive_tokens and substantive_tokens == name_tokens:
+                score = 0.90
             else:
-                score = 0.5
+                name_matches = sum(
+                    1
+                    for q in eval_tokens
+                    if q in name_tokens or any(nt.startswith(q) for nt in name_tokens)
+                )
+
+                if name_matches == num_eval:
+                    # All evaluated terms appear in the symbol name
+                    joined_tokens = "".join(eval_tokens)
+                    joined_snake = "_".join(eval_tokens)
+                    if name_lower.startswith(joined_tokens) or name_lower.startswith(joined_snake):
+                        score = 0.92
+                    else:
+                        score = 0.88
+                else:
+                    # Check all evaluated terms across structural fields (name + qual + file_path)
+                    struct_tokens = set(name_tokens + qual_tokens + file_tokens)
+                    struct_matches = sum(
+                        1
+                        for q in eval_tokens
+                        if q in struct_tokens or any(st.startswith(q) for st in struct_tokens)
+                    )
+
+                    if struct_matches == num_eval:
+                        # Multi-term match across path / class / symbol (e.g. "math add")
+                        score = 0.78
+                    else:
+                        doc_matches = sum(
+                            1
+                            for q in eval_tokens
+                            if q in doc_tokens or any(dt.startswith(q) for dt in doc_tokens)
+                        )
+                        if doc_matches == num_eval:
+                            # All terms match docstring
+                            score = 0.65
+                        elif name_matches > 0:
+                            # Partial symbol name match
+                            score = round(0.50 + 0.10 * (name_matches / num_eval), 2)
+                        elif struct_matches > 0:
+                            # Partial structural match
+                            score = round(0.40 + 0.10 * (struct_matches / num_eval), 2)
+                        elif doc_matches > 0:
+                            # Partial docstring match
+                            score = 0.35
+                        else:
+                            score = 0.20
 
             snippet = n.signature or n.docstring or f"{n.node_type} {n.name} ({n.file_path}:{n.start_line})"
+            scored_results.append((score, n, snippet))
+
+        # Deterministic ranking:
+        # 1. Score descending (-score)
+        # 2. Prefer functional symbols over FILE containers on symbol-directed queries
+        # 3. File path ascending
+        # 4. Start line ascending
+        # 5. Qualified name ascending
+        scored_results.sort(
+            key=lambda item: (
+                -item[0],
+                1 if (not is_file_query and item[1].node_type == "FILE") else 0,
+                item[1].file_path,
+                item[1].start_line,
+                item[1].qualified_name,
+            )
+        )
+
+        results: List[SearchResult] = []
+        for score, n, snippet in scored_results[:limit]:
             results.append(
                 SearchResult(
                     node=GraphNodeSchema.model_validate(n),
@@ -95,8 +250,6 @@ class GraphQueryEngine:
                 )
             )
 
-        # Sort highest score first
-        results.sort(key=lambda r: r.match_score, reverse=True)
         return results
 
     def get_symbol_details(self, node_id: str) -> Optional[Dict[str, Any]]:
@@ -144,6 +297,10 @@ class GraphQueryEngine:
         self, node_id: str, max_depth: int = 5
     ) -> List[Dict[str, Any]]:
         """Finds callers traversing incoming CALLS edges up to max_depth."""
+        center_node = self.db.query(GraphNodeModel).filter_by(id=node_id).first()
+        if not center_node:
+            return []
+
         visited: Set[str] = {node_id}
         queue = deque([(node_id, 0, [])])
         callers: List[Dict[str, Any]] = []
@@ -156,6 +313,7 @@ class GraphQueryEngine:
             incoming = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == center_node.repository_id,
                     GraphEdgeModel.target_id == curr_id,
                     GraphEdgeModel.edge_type == "CALLS",
                 )
@@ -163,7 +321,11 @@ class GraphQueryEngine:
             )
 
             for edge in incoming:
-                caller_node = self.db.query(GraphNodeModel).filter_by(id=edge.source_id).first()
+                caller_node = (
+                    self.db.query(GraphNodeModel)
+                    .filter_by(id=edge.source_id, repository_id=center_node.repository_id)
+                    .first()
+                )
                 if not caller_node:
                     continue
 
@@ -196,6 +358,10 @@ class GraphQueryEngine:
         self, node_id: str, max_depth: int = 5
     ) -> List[Dict[str, Any]]:
         """Finds callees traversing outgoing CALLS edges up to max_depth."""
+        center_node = self.db.query(GraphNodeModel).filter_by(id=node_id).first()
+        if not center_node:
+            return []
+
         visited: Set[str] = {node_id}
         queue = deque([(node_id, 0, [])])
         callees: List[Dict[str, Any]] = []
@@ -208,6 +374,7 @@ class GraphQueryEngine:
             outgoing = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == center_node.repository_id,
                     GraphEdgeModel.source_id == curr_id,
                     GraphEdgeModel.edge_type == "CALLS",
                 )
@@ -215,7 +382,11 @@ class GraphQueryEngine:
             )
 
             for edge in outgoing:
-                callee_node = self.db.query(GraphNodeModel).filter_by(id=edge.target_id).first()
+                callee_node = (
+                    self.db.query(GraphNodeModel)
+                    .filter_by(id=edge.target_id, repository_id=center_node.repository_id)
+                    .first()
+                )
                 if not callee_node:
                     continue
 
@@ -246,9 +417,17 @@ class GraphQueryEngine:
 
     def get_dependencies(self, node_id: str) -> Dict[str, Any]:
         """Returns outgoing IMPORTS and REFERENCES edges for a node or file."""
+        source_node = self.db.query(GraphNodeModel).filter_by(id=node_id).first()
+        if not source_node:
+            return {
+                "internal_dependencies": [],
+                "external_dependencies": [],
+            }
+
         edges = (
             self.db.query(GraphEdgeModel)
             .filter(
+                GraphEdgeModel.repository_id == source_node.repository_id,
                 GraphEdgeModel.source_id == node_id,
                 GraphEdgeModel.edge_type.in_(["IMPORTS", "REFERENCES"]),
             )
@@ -262,7 +441,11 @@ class GraphQueryEngine:
             if e.target_id.startswith("ext:"):
                 external_deps.append({"id": e.target_id, "evidence": e.evidence})
             else:
-                target_node = self.db.query(GraphNodeModel).filter_by(id=e.target_id).first()
+                target_node = (
+                    self.db.query(GraphNodeModel)
+                    .filter_by(id=e.target_id, repository_id=source_node.repository_id)
+                    .first()
+                )
                 if target_node:
                     dep_nodes.append(
                         {
@@ -282,10 +465,21 @@ class GraphQueryEngine:
         self, source_id: str, target_id: str, max_depth: int = 6
     ) -> Optional[List[Dict[str, Any]]]:
         """Finds shortest path between two symbols using bidirectional BFS."""
-        if source_id == target_id:
-            node = self.db.query(GraphNodeModel).filter_by(id=source_id).first()
-            return [{"node_id": source_id, "name": node.name if node else source_id, "edge": None}]
+        source_node = self.db.query(GraphNodeModel).filter_by(id=source_id).first()
+        if not source_node:
+            return None
 
+        if source_id == target_id:
+            return [{"node_id": source_id, "name": source_node.name, "edge": None}]
+
+        target_node = self.db.query(GraphNodeModel).filter_by(id=target_id).first()
+        if not target_node and not target_id.startswith("ext:"):
+            return None
+
+        if target_node and target_node.repository_id != source_node.repository_id:
+            return None
+
+        repo_id = source_node.repository_id
         visited: Set[str] = {source_id}
         queue = deque([(source_id, [])])
 
@@ -294,10 +488,13 @@ class GraphQueryEngine:
             if len(path) >= max_depth:
                 continue
 
-            # Check outgoing and incoming edges for traversal
+            # Check outgoing and incoming edges for traversal, strictly scoped to repo_id
             edges = (
                 self.db.query(GraphEdgeModel)
-                .filter(or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id))
+                .filter(
+                    GraphEdgeModel.repository_id == repo_id,
+                    or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id),
+                )
                 .all()
             )
 
@@ -331,8 +528,12 @@ class GraphQueryEngine:
         max_depth: int = 5,
     ) -> ImpactAnalysisResult:
         """Calculates blast radius: affected symbols, files, and linked tests."""
-        # Check if target is a node_id, file_path, or symbol name
-        target_node = self.db.query(GraphNodeModel).filter_by(id=target_node_or_file).first()
+        # Check if target is a node_id, file_path, or symbol name (scoped to repo_id)
+        target_node = (
+            self.db.query(GraphNodeModel)
+            .filter_by(id=target_node_or_file, repository_id=repo_id)
+            .first()
+        )
 
         if not target_node:
             # Try file path lookup
@@ -376,6 +577,7 @@ class GraphQueryEngine:
             incoming_edges = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == repo_id,
                     GraphEdgeModel.target_id == curr_id,
                     GraphEdgeModel.edge_type.in_(["CALLS", "IMPORTS", "REFERENCES", "CONTAINS"]),
                 )
@@ -418,6 +620,7 @@ class GraphQueryEngine:
             test_edges = (
                 self.db.query(GraphEdgeModel)
                 .filter(
+                    GraphEdgeModel.repository_id == repo_id,
                     GraphEdgeModel.target_id == aff_id,
                     GraphEdgeModel.edge_type.in_(["TESTS", "CALLS"]),
                 )
@@ -456,6 +659,8 @@ class GraphQueryEngine:
             self.db.query(GraphNodeModel)
             .join(GraphEdgeModel, GraphEdgeModel.source_id == GraphNodeModel.id)
             .filter(
+                GraphEdgeModel.repository_id == target_node.repository_id,
+                GraphNodeModel.repository_id == target_node.repository_id,
                 GraphEdgeModel.target_id == node_id,
                 or_(
                     GraphEdgeModel.edge_type == "TESTS",
@@ -473,6 +678,8 @@ class GraphQueryEngine:
             self.db.query(GraphNodeModel)
             .join(GraphEdgeModel, GraphEdgeModel.source_id == GraphNodeModel.id)
             .filter(
+                GraphEdgeModel.repository_id == target_node.repository_id,
+                GraphNodeModel.repository_id == target_node.repository_id,
                 GraphEdgeModel.target_id == file_id,
                 or_(
                     GraphNodeModel.node_type == "TEST",
@@ -506,7 +713,10 @@ class GraphQueryEngine:
             # Outgoing & Incoming
             edges = (
                 self.db.query(GraphEdgeModel)
-                .filter(or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id))
+                .filter(
+                    GraphEdgeModel.repository_id == center_node.repository_id,
+                    or_(GraphEdgeModel.source_id == curr_id, GraphEdgeModel.target_id == curr_id),
+                )
                 .limit(limit)
                 .all()
             )
@@ -519,7 +729,11 @@ class GraphQueryEngine:
                 next_id = e.target_id if e.source_id == curr_id else e.source_id
                 if next_id not in visited_nodes and not next_id.startswith("ext:"):
                     visited_nodes.add(next_id)
-                    next_node = self.db.query(GraphNodeModel).filter_by(id=next_id).first()
+                    next_node = (
+                        self.db.query(GraphNodeModel)
+                        .filter_by(id=next_id, repository_id=center_node.repository_id)
+                        .first()
+                    )
                     if next_node:
                         node_models[next_id] = next_node
                         queue.append((next_id, depth + 1))
@@ -548,3 +762,272 @@ class GraphQueryEngine:
                 for e in edges_list
             ],
         }
+
+    def detect_import_cycles(self, repo_id: str) -> List[List[str]]:
+        """Detects circular import dependencies across internal files in a repository.
+
+        Uses Tarjan's strongly connected components algorithm to find groups of files
+        involved in mutual import loops.
+
+        Output semantics:
+            This method returns cyclic strongly connected components (SCCs), not every
+            individual elementary cycle path. A component is returned if it contains
+            more than one file (multi-node cycle) or exactly one file with an explicit
+            self-loop (file importing itself). Each component is a sorted list of
+            repository-relative file paths, and the outer list of components is sorted
+            deterministically.
+
+        Args:
+            repo_id: The UUID of the repository to diagnose.
+
+        Returns:
+            A deterministically sorted list of cyclic components, where each component
+            is a sorted list of relative file paths. Returns [] for an acyclic repository.
+        """
+        # 1. Fetch all internal IMPORTS edges for this repository
+        edges = (
+            self.db.query(GraphEdgeModel.source_id, GraphEdgeModel.target_id)
+            .filter(
+                GraphEdgeModel.repository_id == repo_id,
+                GraphEdgeModel.edge_type == "IMPORTS",
+            )
+            .all()
+        )
+
+        if not edges:
+            return []
+
+        # 2. Build mapping of internal file node IDs to relative file paths
+        file_nodes = (
+            self.db.query(GraphNodeModel.id, GraphNodeModel.file_path)
+            .filter(
+                GraphNodeModel.repository_id == repo_id,
+                GraphNodeModel.node_type == "FILE",
+            )
+            .all()
+        )
+        node_id_to_rel_path: Dict[str, str] = {fn.id: fn.file_path for fn in file_nodes}
+
+        prefix = f"{repo_id}:file:"
+
+        def resolve_file_path(node_id: str) -> Optional[str]:
+            if not node_id or node_id.startswith("ext:"):
+                return None
+            if node_id in node_id_to_rel_path:
+                return node_id_to_rel_path[node_id]
+            if node_id.startswith(prefix):
+                return node_id[len(prefix):]
+            return None
+
+        # 3. Build adjacency list with deduplicated edges
+        adj: Dict[str, Set[str]] = {}
+        all_files: Set[str] = set()
+
+        for src_id, tgt_id in edges:
+            src_file = resolve_file_path(src_id)
+            tgt_file = resolve_file_path(tgt_id)
+
+            # Both endpoints must resolve to internal repository files
+            if src_file is None or tgt_file is None:
+                continue
+
+            all_files.add(src_file)
+            all_files.add(tgt_file)
+
+            if src_file not in adj:
+                adj[src_file] = set()
+            adj[src_file].add(tgt_file)
+
+        if not all_files:
+            return []
+
+        # 4. Tarjan's strongly connected components algorithm (iterative DFS)
+        index = 0
+        indices: Dict[str, int] = {}
+        lowlink: Dict[str, int] = {}
+        on_stack: Dict[str, bool] = {}
+        stack: List[str] = []
+        cyclic_components: List[List[str]] = []
+
+        for root in sorted(all_files):
+            if root in indices:
+                continue
+
+            dfs_stack: List[Tuple[str, Any]] = []
+
+            indices[root] = index
+            lowlink[root] = index
+            index += 1
+            stack.append(root)
+            on_stack[root] = True
+            dfs_stack.append((root, iter(sorted(adj.get(root, set())))))
+
+            while dfs_stack:
+                u, neighbors = dfs_stack[-1]
+                try:
+                    v = next(neighbors)
+                    if v not in indices:
+                        indices[v] = index
+                        lowlink[v] = index
+                        index += 1
+                        stack.append(v)
+                        on_stack[v] = True
+                        dfs_stack.append((v, iter(sorted(adj.get(v, set())))))
+                    elif on_stack.get(v, False):
+                        lowlink[u] = min(lowlink[u], indices[v])
+                except StopIteration:
+                    dfs_stack.pop()
+                    if dfs_stack:
+                        parent = dfs_stack[-1][0]
+                        lowlink[parent] = min(lowlink[parent], lowlink[u])
+
+                    if lowlink[u] == indices[u]:
+                        scc: List[str] = []
+                        while True:
+                            w = stack.pop()
+                            on_stack[w] = False
+                            scc.append(w)
+                            if w == u:
+                                break
+                        # Component is cyclic if > 1 node or 1 node with an explicit self-loop
+                        is_cyclic = len(scc) > 1 or (len(scc) == 1 and scc[0] in adj.get(scc[0], set()))
+                        if is_cyclic:
+                            cyclic_components.append(sorted(scc))
+
+        # 5. Deterministic sorting: components sorted by first file path, then length
+        cyclic_components.sort(key=lambda c: (c[0], len(c)))
+        return cyclic_components
+
+    def get_god_nodes(
+        self,
+        repo_id: str,
+        limit: int = 20,
+        scope: str = "all",
+    ) -> List[GodNodeItem]:
+        """Identifies architectural hub nodes (god nodes) ranked by connectivity and call centrality.
+
+        Scoring formula:
+            god_score = 2 * in_degree + 3 * incoming_calls + out_degree
+
+        Note: incoming_calls are included in in_degree, so each incoming CALLS relationship
+        contributes 5 points total (2 points from in_degree + 3 points from incoming_calls).
+        All metrics count distinct internal relationships within the repository.
+        External stubs and cross-repository edges are strictly excluded from internal degrees
+        and candidate results.
+
+        Args:
+            repo_id: Repository UUID.
+            limit: Maximum results to return (default 20). Returns [] if limit <= 0.
+            scope: Filter scope:
+                - 'all': Ranks all internal nodes (files and symbols).
+                - 'file': Ranks only FILE container nodes.
+                - 'symbol': Ranks only symbols (all non-FILE nodes).
+
+        Returns:
+            Deterministically sorted list of GodNodeItem objects.
+
+        Raises:
+            ValueError: If repository repo_id does not exist or scope is invalid.
+        """
+        repo = self.db.query(RepositoryModel).filter_by(id=repo_id).first()
+        if not repo:
+            raise ValueError(f"Repository '{repo_id}' not found")
+
+        if scope not in ("all", "file", "symbol"):
+            raise ValueError(f"Invalid scope '{scope}'. Must be 'all', 'file', or 'symbol'")
+
+        if limit <= 0:
+            return []
+
+        # 1. Fetch all valid, internal, deduplicated relationships within repo_id.
+        # Both source and target must be internal nodes belonging to repo_id.
+        # Deduplicating on (source_id, target_id, edge_type) ensures:
+        # - Duplicate stored edges for the same relationship type are counted once.
+        # - Distinct relationship types between the same endpoints are preserved.
+        SourceNode = aliased(GraphNodeModel)
+        TargetNode = aliased(GraphNodeModel)
+
+        valid_edges = (
+            self.db.query(
+                GraphEdgeModel.source_id,
+                GraphEdgeModel.target_id,
+                GraphEdgeModel.edge_type,
+            )
+            .join(SourceNode, GraphEdgeModel.source_id == SourceNode.id)
+            .join(TargetNode, GraphEdgeModel.target_id == TargetNode.id)
+            .filter(
+                GraphEdgeModel.repository_id == repo_id,
+                SourceNode.repository_id == repo_id,
+                TargetNode.repository_id == repo_id,
+                ~GraphEdgeModel.target_id.startswith("ext:"),
+                ~GraphEdgeModel.source_id.startswith("ext:"),
+            )
+            .distinct()
+            .all()
+        )
+
+        in_degree_counts: Dict[str, int] = {}
+        incoming_calls_counts: Dict[str, int] = {}
+        out_degree_counts: Dict[str, int] = {}
+
+        for src, tgt, edge_type in valid_edges:
+            out_degree_counts[src] = out_degree_counts.get(src, 0) + 1
+            in_degree_counts[tgt] = in_degree_counts.get(tgt, 0) + 1
+            if edge_type == "CALLS":
+                incoming_calls_counts[tgt] = incoming_calls_counts.get(tgt, 0) + 1
+
+        # 2. Query candidate nodes in repository matching scope
+        node_query = self.db.query(GraphNodeModel).filter(
+            GraphNodeModel.repository_id == repo_id,
+        )
+        if scope == "file":
+            node_query = node_query.filter(GraphNodeModel.node_type == "FILE")
+        elif scope == "symbol":
+            node_query = node_query.filter(GraphNodeModel.node_type != "FILE")
+
+        candidate_nodes = node_query.all()
+
+        scored_items: List[GodNodeItem] = []
+        for node in candidate_nodes:
+            in_deg = in_degree_counts.get(node.id, 0)
+            out_deg = out_degree_counts.get(node.id, 0)
+            in_calls = incoming_calls_counts.get(node.id, 0)
+
+            score = (2.0 * in_deg) + (3.0 * in_calls) + (1.0 * out_deg)
+            # Exclude zero-score isolated nodes
+            if score <= 0.0:
+                continue
+
+            scored_items.append(
+                GodNodeItem(
+                    node=GraphNodeSchema.model_validate(node),
+                    god_score=round(score, 2),
+                    in_degree=in_deg,
+                    out_degree=out_deg,
+                    incoming_calls=in_calls,
+                )
+            )
+
+        # 3. Deterministic sorting:
+        # - score descending
+        # - incoming calls descending
+        # - in-degree descending
+        # - file path ascending (null-safe)
+        # - start line ascending (null-safe)
+        # - name ascending (null-safe)
+        # - node ID ascending (null-safe)
+        scored_items.sort(
+            key=lambda item: (
+                -item.god_score,
+                -item.incoming_calls,
+                -item.in_degree,
+                item.node.file_path or "",
+                item.node.start_line if item.node.start_line is not None else 0,
+                item.node.name or "",
+                item.node.id or "",
+            )
+        )
+
+        return scored_items[:limit]
+
+

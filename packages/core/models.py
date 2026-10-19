@@ -193,3 +193,23 @@ class ImpactAnalysisResult(BaseModel):
     traversal_depth: int
     total_affected: int
     evidence_paths: List[Dict[str, Any]]
+
+
+class GodNodeItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    node: GraphNodeSchema
+    god_score: float
+    in_degree: int
+    out_degree: int
+    incoming_calls: int
+
+
+class GodNodesResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    repository_id: str
+    scope: str
+    total_results: int
+    god_nodes: List[GodNodeItem]
+

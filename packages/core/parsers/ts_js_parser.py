@@ -5,20 +5,22 @@ Extracts classes, interfaces, types, functions, methods, tests,
 imports, exports, and call relationships with precise locations.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 import tree_sitter
 import tree_sitter_javascript
 import tree_sitter_typescript
 
 from packages.core.parsers.base import (
+    BaseParser,
     ExtractedCall,
     ExtractedImport,
     ExtractedNode,
+    ExtractedReExport,
     ParseResult,
 )
 
 
-class TypeScriptJavaScriptParser:
+class TypeScriptJavaScriptParser(BaseParser):
     def __init__(self):
         self.ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
         self.tsx_lang = tree_sitter.Language(tree_sitter_typescript.language_tsx())
@@ -80,6 +82,13 @@ class TypeScriptJavaScriptParser:
         if node.type == "import_statement":
             self._handle_import(node, code_bytes, result)
             return
+
+        # 1.5. Export statements with source (re-exports: export ... from "...")
+        if node.type == "export_statement":
+            source_node = node.child_by_field_name("source")
+            if source_node:
+                self._handle_reexport(node, source_node, code_bytes, result)
+                return
 
         # 2. Interfaces
         if node.type == "interface_declaration":
@@ -358,3 +367,53 @@ class TypeScriptJavaScriptParser:
             lines = [line.strip().lstrip("/*").rstrip("*/").lstrip("*").strip() for line in raw.splitlines()]
             return "\n".join(l for l in lines if l)
         return ""
+
+    def _handle_reexport(
+        self,
+        node: tree_sitter.Node,
+        source_node: tree_sitter.Node,
+        code_bytes: bytes,
+        result: ParseResult,
+    ):
+        raw = code_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="ignore").strip()
+        module_path = (
+            code_bytes[source_node.start_byte:source_node.end_byte]
+            .decode("utf-8", errors="ignore")
+            .strip("'\"")
+        )
+
+        is_wildcard = False
+        exported_symbols: Dict[str, str] = {}  # exported_name -> source_name
+
+        for child in node.children:
+            if child.type == "*":
+                is_wildcard = True
+            elif child.type == "namespace_export":
+                is_wildcard = True
+                for sub in child.children:
+                    if sub.type == "identifier":
+                        ns_name = code_bytes[sub.start_byte:sub.end_byte].decode("utf-8", errors="ignore")
+                        exported_symbols[ns_name] = "*"
+            elif child.type == "export_clause":
+                for spec in child.children:
+                    if spec.type == "export_specifier":
+                        name_node = spec.child_by_field_name("name")
+                        alias_node = spec.child_by_field_name("alias")
+                        if name_node:
+                            src_name = code_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
+                            exp_name = (
+                                code_bytes[alias_node.start_byte:alias_node.end_byte].decode("utf-8", errors="ignore")
+                                if alias_node
+                                else src_name
+                            )
+                            exported_symbols[exp_name] = src_name
+
+        result.re_exports.append(
+            ExtractedReExport(
+                module_path=module_path,
+                exported_symbols=exported_symbols,
+                is_wildcard=is_wildcard,
+                line_number=node.start_point.row + 1,
+                raw_statement=raw,
+            )
+        )
