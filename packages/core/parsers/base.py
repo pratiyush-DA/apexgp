@@ -43,6 +43,7 @@ class ExtractedCall(BaseModel):
     callee_name: str  # Function or method being invoked
     line_number: int = 1
     raw_call: str = ""
+    edge_type: str = "CALLS"  # Relationship edge type: CALLS, REFERENCES, etc.
 
 
 class ExtractedReExport(BaseModel):
