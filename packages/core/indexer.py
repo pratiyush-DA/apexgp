@@ -590,26 +590,21 @@ class RepositoryIndexer:
 
                     if target_candidate:
                         conf = 1.0 if target_candidate.file_path == rel_path else 0.85
+                        call_edge_type = getattr(call, "edge_type", "CALLS") or "CALLS"
+
+                        # Guard against SQL tables/views/columns receiving CALLS edges
+                        if parse_res.language == "sql" and target_candidate.node_type in ("CLASS", "TYPE", "VARIABLE"):
+                            call_edge_type = "REFERENCES"
+
                         add_edge(
                             source_id=caller_id,
                             target_id=target_candidate.id,
-                            edge_type="CALLS",
+                            edge_type=call_edge_type,
                             file_path=rel_path,
                             line_no=call.line_number,
                             confidence=conf,
                             evidence=call.raw_call,
                         )
-
-                        if parse_res.language == "sql" and target_candidate.node_type in ("CLASS", "TYPE", "VARIABLE"):
-                            add_edge(
-                                source_id=caller_id,
-                                target_id=target_candidate.id,
-                                edge_type="REFERENCES",
-                                file_path=rel_path,
-                                line_no=call.line_number,
-                                confidence=conf,
-                                evidence=call.raw_call,
-                            )
 
                         # If caller is a TEST node, create explicit TESTS relationship
                         caller_node = nodes_by_id.get(caller_id)
@@ -881,6 +876,9 @@ class RepositoryIndexer:
                 base_language = "yaml"
 
         is_python = base_language == "python"
+        is_typescript = base_language in ("typescript", "ts")
+        is_javascript = base_language in ("javascript", "js")
+        is_ts_or_js = is_typescript or is_javascript
         is_go = base_language == "go"
         is_rust = base_language == "rust"
         is_sql = base_language == "sql"
@@ -892,6 +890,9 @@ class RepositoryIndexer:
             clean_path = import_path.strip().strip("'\"")
             if "#" in clean_path:
                 clean_path = clean_path.split("#")[0].strip()
+
+            if not clean_path:
+                return None
 
             rel_candidate = os.path.normpath(os.path.join(base_dir, clean_path)).replace("\\", "/")
             if rel_candidate in known_files:
@@ -910,17 +911,26 @@ class RepositoryIndexer:
                     if cand2 in known_files:
                         return cand2
 
-            base_name = os.path.basename(clean_path)
-            for kf in known_files:
-                if any(kf.endswith(ext) for ext in (".yaml", ".yml", ".json")):
-                    if os.path.basename(kf) == base_name or os.path.splitext(os.path.basename(kf))[0] == base_name:
-                        return kf
+            # Basename fallback: only if bare filename (no directory path components)
+            is_bare_name = ("/" not in clean_path and "\\" not in clean_path)
+            if is_bare_name:
+                base_name = os.path.basename(clean_path)
+                candidates = [
+                    kf for kf in sorted(known_files)
+                    if any(kf.endswith(ext) for ext in (".yaml", ".yml", ".json"))
+                    and (os.path.basename(kf) == base_name or os.path.splitext(os.path.basename(kf))[0] == base_name)
+                ]
+                if len(candidates) == 1:
+                    return candidates[0]
             return None
 
         if is_json:
             clean_path = import_path.strip().strip("'\"")
             if "#" in clean_path:
                 clean_path = clean_path.split("#")[0].strip()
+
+            if not clean_path:
+                return None
 
             rel_candidate = os.path.normpath(os.path.join(base_dir, clean_path)).replace("\\", "/")
             if rel_candidate in known_files:
@@ -938,16 +948,23 @@ class RepositoryIndexer:
                 if cand2 in known_files:
                     return cand2
 
-            base_name = os.path.basename(clean_path)
-            for kf in known_files:
-                if os.path.basename(kf) == base_name and kf.endswith(".json"):
-                    return kf
+            # Basename fallback: only if bare filename (no directory path components)
+            is_bare_name = ("/" not in clean_path and "\\" not in clean_path)
+            if is_bare_name:
+                base_name = os.path.basename(clean_path)
+                candidates = [
+                    kf for kf in sorted(known_files)
+                    if os.path.basename(kf) == base_name and kf.endswith(".json")
+                ]
+                if len(candidates) == 1:
+                    return candidates[0]
             return None
 
         if is_shell:
             clean_path = import_path.strip().strip("'\"")
             # If path contains variable like "$DIR/lib.sh" or "${SCRIPT_DIR}/lib.sh", strip variable prefix
-            if "$" in clean_path:
+            has_variable = "$" in clean_path
+            if has_variable:
                 cleaned_var = clean_path.split("/")[-1]
             else:
                 cleaned_var = clean_path
@@ -977,11 +994,16 @@ class RepositoryIndexer:
                 if cand2 in known_files:
                     return cand2
 
-            # 5. Basename fallback among known shell scripts
-            base_name = os.path.basename(cleaned_var)
-            for kf in known_files:
-                if os.path.basename(kf) == base_name and any(kf.endswith(sh_ext) for sh_ext in (".sh", ".bash", ".zsh")):
-                    return kf
+            # 5. Basename fallback only if unambiguous bare filename or variable path
+            is_bare_name = ("/" not in clean_path and "\\" not in clean_path)
+            if is_bare_name or has_variable:
+                base_name = os.path.basename(cleaned_var)
+                candidates = [
+                    kf for kf in sorted(known_files)
+                    if os.path.basename(kf) == base_name and any(kf.endswith(sh_ext) for sh_ext in (".sh", ".bash", ".zsh"))
+                ]
+                if len(candidates) == 1:
+                    return candidates[0]
             return None
 
         if is_sql:
@@ -994,10 +1016,17 @@ class RepositoryIndexer:
             root_candidate = os.path.normpath(clean_path).replace("\\", "/")
             if root_candidate in known_files:
                 return root_candidate
-            base_name = os.path.basename(clean_path)
-            for kf in known_files:
-                if os.path.basename(kf) == base_name and kf.endswith(".sql"):
-                    return kf
+
+            # Basename fallback: only if bare filename (no directory path components)
+            is_bare_name = ("/" not in clean_path and "\\" not in clean_path)
+            if is_bare_name:
+                base_name = os.path.basename(clean_path)
+                candidates = [
+                    kf for kf in sorted(known_files)
+                    if os.path.basename(kf) == base_name and kf.endswith(".sql")
+                ]
+                if len(candidates) == 1:
+                    return candidates[0]
             return None
 
         if is_rust:
@@ -1060,7 +1089,7 @@ class RepositoryIndexer:
                     f"{joined}.py",
                     f"{joined}/__init__.py",
                 ]
-            else:
+            elif is_ts_or_js:
                 candidates = [
                     joined,
                     f"{joined}.ts",
@@ -1072,13 +1101,15 @@ class RepositoryIndexer:
                     f"{joined}/index.js",
                     f"{joined}/index.jsx",
                 ]
+            else:
+                candidates = []
             for cand in candidates:
                 if cand in known_files:
                     return cand
 
         # Check TypeScript path aliases (baseUrl and paths from tsconfig.json)
         # ONLY apply to TypeScript/JavaScript files.
-        if not is_python and not is_go and not is_rust and not is_sql and not is_shell and not is_json:
+        if is_ts_or_js:
             if self.tsconfig_paths:
                 for pattern, target_list in self.tsconfig_paths.items():
                     matched = False
@@ -1754,24 +1785,20 @@ class RepositoryIndexer:
 
             if target_candidate:
                 conf = 1.0 if target_candidate.file_path == rel_path else 0.85
+                call_edge_type = getattr(call, "edge_type", "CALLS") or "CALLS"
+
+                # Guard against SQL tables/views/columns receiving CALLS edges
+                if parse_res.language == "sql" and target_candidate.node_type in ("CLASS", "TYPE", "VARIABLE"):
+                    call_edge_type = "REFERENCES"
+
                 add_edge(
                     source_id=caller_id,
                     target_id=target_candidate.id,
-                    edge_type="CALLS",
+                    edge_type=call_edge_type,
                     line_no=call.line_number,
                     confidence=conf,
                     evidence=call.raw_call,
                 )
-
-                if parse_res.language == "sql" and target_candidate.node_type in ("CLASS", "TYPE", "VARIABLE"):
-                    add_edge(
-                        source_id=caller_id,
-                        target_id=target_candidate.id,
-                        edge_type="REFERENCES",
-                        line_no=call.line_number,
-                        confidence=conf,
-                        evidence=call.raw_call,
-                    )
 
                 caller_node = local_nodes_by_id.get(caller_id) or self.db.query(GraphNodeModel).filter_by(id=caller_id, repository_id=repository_id).first()
                 if caller_node and caller_node.node_type == "TEST":

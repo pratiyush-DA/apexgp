@@ -48,6 +48,11 @@ SQL_BUILTIN_FUNCTIONS: Set[str] = {
     "truncate", "upper", "user", "variance", "year",
 }
 
+SQL_NON_PROCEDURE_KEYWORDS: Set[str] = {
+    "immediate", "statement", "prepared", "format", "query", "plan",
+    "select", "set", "values", "default", "null", "into", "from", "where",
+}
+
 
 class SQLParser(BaseParser):
     """AST parser for SQL source files supporting PostgreSQL, Oracle, MySQL, SQLite, and Generic dialects."""
@@ -389,13 +394,18 @@ class SQLParser(BaseParser):
             if cmd_name in ("CALL", "EXEC", "EXECUTE"):
                 expr_text = str(stmt.args.get("expression") or "")
                 callee = self._parse_callee_from_command(expr_text)
-                if callee:
+                if (
+                    callee
+                    and callee.lower() not in SQL_NON_PROCEDURE_KEYWORDS
+                    and callee.lower() not in SQL_BUILTIN_FUNCTIONS
+                ):
                     calls.append(
                         ExtractedCall(
                             caller_name="<module>",
                             callee_name=callee,
                             line_number=start_line,
                             raw_call=raw_sql[:200],
+                            edge_type="CALLS",
                         )
                     )
             return
@@ -470,6 +480,7 @@ class SQLParser(BaseParser):
                                         callee_name=target_tbl_name,
                                         line_number=start_line,
                                         raw_call=f"FOREIGN KEY ({cname}) REFERENCES {target_tbl_name}",
+                                        edge_type="REFERENCES",
                                     )
                                 )
 
@@ -528,6 +539,7 @@ class SQLParser(BaseParser):
                                             callee_name=target_tbl_name,
                                             line_number=start_line,
                                             raw_call=f"FOREIGN KEY REFERENCES {target_tbl_name}",
+                                            edge_type="REFERENCES",
                                         )
                                     )
 
@@ -600,6 +612,7 @@ class SQLParser(BaseParser):
                             callee_name=tbl.name,
                             line_number=start_line,
                             raw_call=f"VIEW {view_name} REFERENCES {tbl.name}",
+                            edge_type="REFERENCES",
                         )
                     )
 
@@ -661,8 +674,27 @@ class SQLParser(BaseParser):
                         callee_name=b_tbl,
                         line_number=start_line,
                         raw_call=f"PROCEDURE {proc_name} ACCESSES {b_tbl}",
+                        edge_type="REFERENCES",
                     )
                 )
+
+            # Extract procedure/function calls inside the procedure body
+            for m_call in re.finditer(r"\b(?:CALL|EXEC|EXECUTE)\s+([a-zA-Z0-9_\.]+)", raw_sql, re.IGNORECASE):
+                callee_proc = m_call.group(1).split(".")[-1]
+                if (
+                    callee_proc.lower() != proc_name.lower()
+                    and callee_proc.lower() not in SQL_NON_PROCEDURE_KEYWORDS
+                    and callee_proc.lower() not in SQL_BUILTIN_FUNCTIONS
+                ):
+                    calls.append(
+                        ExtractedCall(
+                            caller_name=proc_name,
+                            callee_name=callee_proc,
+                            line_number=start_line,
+                            raw_call=f"CALL {callee_proc}",
+                            edge_type="CALLS",
+                        )
+                    )
 
         # D. CREATE SCHEMA
         elif "SCHEMA" in kind:
@@ -698,6 +730,7 @@ class SQLParser(BaseParser):
                             callee_name=ref_tbl,
                             line_number=line_number,
                             raw_call=f"ALTER TABLE {target_tbl} REFERENCES {ref_tbl}",
+                            edge_type="REFERENCES",
                         )
                     )
 
@@ -714,6 +747,7 @@ class SQLParser(BaseParser):
                         callee_name=tname,
                         line_number=line_number,
                         raw_call=raw_sql[:200],
+                        edge_type="REFERENCES",
                     )
                 )
 
@@ -727,6 +761,7 @@ class SQLParser(BaseParser):
                         callee_name=fname,
                         line_number=line_number,
                         raw_call=f"SELECT {fname}(...)",
+                        edge_type="CALLS",
                     )
                 )
 
@@ -745,14 +780,19 @@ class SQLParser(BaseParser):
         m_call = re.search(r"\b(?:CALL|EXEC|EXECUTE)\s+([a-zA-Z0-9_\.]+)", raw_sql, re.IGNORECASE)
         if m_call:
             callee = m_call.group(1).split(".")[-1]
-            calls.append(
-                ExtractedCall(
-                    caller_name="<module>",
-                    callee_name=callee,
-                    line_number=line_number,
-                    raw_call=raw_sql[:200],
+            if (
+                callee.lower() not in SQL_NON_PROCEDURE_KEYWORDS
+                and callee.lower() not in SQL_BUILTIN_FUNCTIONS
+            ):
+                calls.append(
+                    ExtractedCall(
+                        caller_name="<module>",
+                        callee_name=callee,
+                        line_number=line_number,
+                        raw_call=raw_sql[:200],
+                        edge_type="CALLS",
+                    )
                 )
-            )
 
         # FROM / JOIN table references
         for m_table in re.finditer(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z0-9_]+)", raw_sql, re.IGNORECASE):
@@ -764,6 +804,7 @@ class SQLParser(BaseParser):
                         callee_name=tbl,
                         line_number=line_number,
                         raw_call=raw_sql[:200],
+                        edge_type="REFERENCES",
                     )
                 )
 
