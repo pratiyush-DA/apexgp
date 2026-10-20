@@ -11,7 +11,16 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from packages.core.models import Base
 
-DEFAULT_DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./data/apexgraph.db")
+def _get_default_db_url() -> str:
+    env_url = os.environ.get("DATABASE_URL")
+    if env_url:
+        return env_url
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = os.path.join(repo_root, "data")
+    db_file = os.path.join(data_dir, "apexgraph.db").replace("\\", "/")
+    return f"sqlite:///{db_file}"
+
+DEFAULT_DB_URL = _get_default_db_url()
 
 
 def get_engine(db_url: str = DEFAULT_DB_URL):

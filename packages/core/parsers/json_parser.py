@@ -1,17 +1,6 @@
-"""Tree-sitter AST Parser for JSON Files (.json).
-
-Extracts:
-- Objects (TYPE): Structural JSON objects, schemas, sections
-- Properties (VARIABLE): Key-value pairs (primitives and arrays)
-- Cross-file References (ExtractedImport):
-  - JSON Schema $ref references (e.g. "./common.json#/definitions/User")
-  - Configuration extends references (e.g. "./tsconfig.base.json")
-- Bounded Graph Depth: Limits structural traversal to depth <= 4 to prevent node explosion
-- Syntax Error Resilience: Resilient error recovery and partial AST extraction on malformed JSON
-- Declarative Guarantee: Zero artificial CALLS edges generated
-"""
-
-from typing import Any, Dict, List, Optional, Set, Tuple
+﻿import bisect
+import json
+from typing import Any, Dict, List, Optional, Tuple
 import tree_sitter
 import tree_sitter_json
 
@@ -26,16 +15,14 @@ from packages.core.parsers.base import (
 
 MAX_JSON_DEPTH = 4
 
-
 class JsonParser(BaseParser):
-    """Tree-sitter based AST parser for JSON files (.json)."""
+    """AST parser for JSON files (.json)."""
 
     def __init__(self):
         self.json_lang = tree_sitter.Language(tree_sitter_json.language())
         self.parser = tree_sitter.Parser(self.json_lang)
 
     def parse_code(self, code: str, file_path: str = "") -> ParseResult:
-        """Parses JSON source code into a standardized ParseResult."""
         if not code or not code.strip():
             return ParseResult(
                 file_path=file_path,
@@ -48,28 +35,139 @@ class JsonParser(BaseParser):
                 syntax_errors=[],
             )
 
-        encoded = code.encode("utf-8")
-        tree = self.parser.parse(encoded)
+        code_bytes = code.encode("utf-8")
+        line_offsets = [0]
+        for line in code_bytes.splitlines(keepends=True):
+            line_offsets.append(line_offsets[-1] + len(line))
 
+        def byte_to_point(b: int) -> Tuple[int, int]:
+            row = bisect.bisect_right(line_offsets, b) - 1
+            col = b - line_offsets[row]
+            return row + 1, col
+
+        tree = self.parser.parse(code_bytes)
         nodes: List[ExtractedNode] = []
         imports: List[ExtractedImport] = []
         syntax_errors: List[str] = []
 
         if tree.root_node.has_error:
-            self._collect_errors(tree.root_node, syntax_errors, encoded)
+            def _raise_const(c):
+                raise ValueError(f"Unquoted constant '{c}' is not valid JSON")
+            try:
+                json.loads(code, parse_constant=_raise_const)
+            except Exception as jde:
+                syntax_errors.append(f"JSON syntax error: {str(jde)}")
+            if not syntax_errors:
+                syntax_errors.append("JSON syntax error: malformed structure")
 
-        # Traverse the AST starting from the root document
-        self._traverse_node(
-            node=tree.root_node,
-            code_bytes=encoded,
-            current_path="",
-            enclosing="",
-            depth=1,
-            nodes=nodes,
-            imports=imports,
-        )
+        cursor = tree.walk()
+        visited = False
+        # Scope stack: (cursor_depth, qualified_path, enclosing_path, json_depth)
+        scope_stack = [(0, "", "", 0)]
+        array_index_map: Dict[int, int] = {}
 
-        # Deterministic ordering
+        while True:
+            node = cursor.node
+            depth = cursor.depth
+            ntype = node.type
+            skip_children = False
+
+            if not visited:
+                # Pop scopes deeper than current depth
+                while len(scope_stack) > 1 and scope_stack[-1][0] >= depth:
+                    scope_stack.pop()
+
+                for d in list(array_index_map.keys()):
+                    if d >= depth:
+                        del array_index_map[d]
+
+                curr_scope = scope_stack[-1]
+                curr_path = curr_scope[1]
+                curr_enclosing = curr_scope[2]
+                curr_json_depth = curr_scope[3]
+
+                if ntype == "pair" and curr_json_depth < MAX_JSON_DEPTH:
+                    key_node = node.child_by_field_name("key")
+                    val_node = node.child_by_field_name("value")
+
+                    if key_node and val_node:
+                        k_sb, k_eb = key_node.start_byte, key_node.end_byte
+                        key_raw = code_bytes[k_sb:k_eb].decode("utf-8", errors="ignore").strip()
+                        key_name = key_raw.strip('"\'')
+
+                        if key_name:
+                            qname = f"{curr_path}.{key_name}" if curr_path else key_name
+                            v_sb, v_eb = val_node.start_byte, val_node.end_byte
+                            val_type = val_node.type
+                            val_text = code_bytes[v_sb:min(v_eb, v_sb + 100)].decode("utf-8", errors="ignore").replace("\n", " ").strip()
+
+                            start_line, start_col = byte_to_point(node.start_byte)
+                            end_line, end_col = byte_to_point(node.end_byte)
+
+                            if key_name == "$ref" and val_type == "string":
+                                ref_val = val_text.strip('"\'')
+                                self._handle_ref_import(ref_val, start_line, imports)
+                            elif key_name == "extends":
+                                if val_type == "string":
+                                    ext_val = val_text.strip('"\'')
+                                    self._handle_extends_import(ext_val, start_line, imports)
+                                elif val_type == "array":
+                                    for idx in range(val_node.child_count):
+                                        c = val_node.child(idx)
+                                        if c and c.type == "string":
+                                            c_text = code_bytes[c.start_byte:c.end_byte].decode("utf-8", errors="ignore").strip('"\'')
+                                            c_line, _ = byte_to_point(c.start_byte)
+                                            self._handle_extends_import(c_text, c_line, imports)
+
+                            node_type = "TYPE" if val_type == "object" else "VARIABLE"
+                            json_meta_type = "object" if val_type == "object" else ("array" if val_type == "array" else "primitive")
+
+                            nodes.append(
+                                ExtractedNode(
+                                    name=key_name,
+                                    node_type=node_type,
+                                    qualified_name=qname,
+                                    start_line=start_line,
+                                    end_line=end_line,
+                                    start_col=start_col,
+                                    end_col=end_col,
+                                    language="json",
+                                    signature=f'"{key_name}": {val_type}',
+                                    docstring="",
+                                    metadata={
+                                        "json_type": json_meta_type,
+                                        "enclosing": curr_path,
+                                        "depth": curr_json_depth + 1,
+                                    },
+                                )
+                            )
+
+                            if val_type == "object":
+                                scope_stack.append((depth, qname, curr_path, curr_json_depth + 1))
+                            elif val_type == "array":
+                                scope_stack.append((depth, qname, curr_path, curr_json_depth + 1))
+
+                elif ntype == "array":
+                    array_index_map[depth] = 0
+
+                elif ntype in ("object", "array") and (depth - 1) in array_index_map:
+                    idx = array_index_map[depth - 1]
+                    array_index_map[depth - 1] += 1
+                    elem_path = f"{curr_path}[{idx}]"
+                    scope_stack.append((depth, elem_path, curr_path, curr_json_depth + 1))
+
+                if not skip_children and cursor.goto_first_child():
+                    visited = False
+                    continue
+
+            visited = False
+            if cursor.goto_next_sibling():
+                continue
+            if cursor.goto_parent():
+                visited = True
+                continue
+            break
+
         nodes.sort(key=lambda n: (n.start_line, n.qualified_name))
         imports.sort(key=lambda i: (i.line_number, i.module_path))
 
@@ -78,192 +176,22 @@ class JsonParser(BaseParser):
             language="json",
             nodes=nodes,
             imports=imports,
-            calls=[],  # JSON is declarative; zero artificial calls
+            calls=[],
             exports=[n.name for n in nodes if n.node_type == "TYPE"],
             re_exports=[],
             syntax_errors=syntax_errors,
         )
 
-    def _collect_errors(self, node: tree_sitter.Node, syntax_errors: List[str], code_bytes: bytes) -> None:
-        """Recursively collects syntax error nodes."""
-        if node.is_error or node.is_missing or node.type == "ERROR":
-            line = node.start_point.row + 1
-            if node.is_missing:
-                syntax_errors.append(f"JSON syntax error at line {line}: missing {node.type}")
-            else:
-                snippet = code_bytes[node.start_byte:min(node.end_byte, node.start_byte + 50)].decode("utf-8", errors="ignore").replace("\n", " ")
-                syntax_errors.append(f"JSON syntax error at line {line}: {snippet}")
-        for child in node.children:
-            self._collect_errors(child, syntax_errors, code_bytes)
-
-    def _traverse_node(
-        self,
-        node: tree_sitter.Node,
-        code_bytes: bytes,
-        current_path: str,
-        enclosing: str,
-        depth: int,
-        nodes: List[ExtractedNode],
-        imports: List[ExtractedImport],
-    ) -> None:
-        """Traverses AST nodes extracting pairs and handling depth bounding."""
-        if depth > MAX_JSON_DEPTH:
-            return
-
-        if node.type == "pair":
-            self._handle_pair(
-                pair_node=node,
-                code_bytes=code_bytes,
-                parent_path=current_path,
-                enclosing=enclosing,
-                depth=depth,
-                nodes=nodes,
-                imports=imports,
-            )
-            return
-
-        if node.type == "array":
-            elem_idx = 0
-            for child in node.children:
-                if child.type in ("object", "array"):
-                    elem_path = f"{current_path}[{elem_idx}]" if current_path else f"[{elem_idx}]"
-                    self._traverse_node(
-                        node=child,
-                        code_bytes=code_bytes,
-                        current_path=elem_path,
-                        enclosing=current_path,
-                        depth=depth + 1,
-                        nodes=nodes,
-                        imports=imports,
-                    )
-                    elem_idx += 1
-            return
-
-        # Recurse for container nodes (document, object, ERROR)
-        for child in node.children:
-            if child.type in ("pair", "object", "array", "ERROR", "document"):
-                self._traverse_node(
-                    node=child,
-                    code_bytes=code_bytes,
-                    current_path=current_path,
-                    enclosing=enclosing,
-                    depth=depth,
-                    nodes=nodes,
-                    imports=imports,
-                )
-
-    def _handle_pair(
-        self,
-        pair_node: tree_sitter.Node,
-        code_bytes: bytes,
-        parent_path: str,
-        enclosing: str,
-        depth: int,
-        nodes: List[ExtractedNode],
-        imports: List[ExtractedImport],
-    ) -> None:
-        """Extracts property node and checks for $ref or extends imports."""
-        key_node = pair_node.child_by_field_name("key")
-        val_node = pair_node.child_by_field_name("value")
-        if not key_node or not val_node:
-            return
-
-        key_raw = code_bytes[key_node.start_byte:key_node.end_byte].decode("utf-8", errors="ignore").strip()
-        key_name = key_raw.strip('"\'')
-        if not key_name:
-            return
-
-        qname = f"{parent_path}.{key_name}" if parent_path else key_name
-        line_num = pair_node.start_point.row + 1
-        end_line = pair_node.end_point.row + 1
-
-        val_type = val_node.type
-        val_text = code_bytes[val_node.start_byte:min(val_node.end_byte, val_node.start_byte + 100)].decode("utf-8", errors="ignore").replace("\n", " ").strip()
-
-        # Check for cross-file imports ($ref, extends)
-        if key_name == "$ref" and val_type == "string":
-            ref_val = val_text.strip('"\'')
-            self._handle_ref_import(ref_val, line_num, pair_node.text.decode("utf-8", errors="ignore"), imports)
-
-        elif key_name == "extends":
-            if val_type == "string":
-                ext_val = val_text.strip('"\'')
-                self._handle_extends_import(ext_val, line_num, pair_node.text.decode("utf-8", errors="ignore"), imports)
-            elif val_type == "array":
-                for child in val_node.children:
-                    if child.type == "string":
-                        ext_val = child.text.decode("utf-8", errors="ignore").strip('"\'')
-                        self._handle_extends_import(ext_val, child.start_point.row + 1, child.text.decode("utf-8", errors="ignore"), imports)
-
-        # Map to TYPE if object, VARIABLE if primitive/array
-        node_type = "TYPE" if val_type == "object" else "VARIABLE"
-        json_meta_type = "object" if val_type == "object" else ("array" if val_type == "array" else "primitive")
-
-        nodes.append(
-            ExtractedNode(
-                name=key_name,
-                node_type=node_type,
-                qualified_name=qname,
-                start_line=line_num,
-                end_line=end_line,
-                start_col=pair_node.start_point.column,
-                end_col=pair_node.end_point.column,
-                language="json",
-                signature=f'"{key_name}": {val_type}',
-                docstring="",
-                metadata={
-                    "json_type": json_meta_type,
-                    "enclosing": parent_path,
-                    "depth": depth,
-                },
-            )
-        )
-
-        # If value is object or array, recurse up to MAX_JSON_DEPTH
-        if val_type in ("object", "array"):
-            if val_type == "array":
-                elem_idx = 0
-                for child in val_node.children:
-                    if child.type in ("object", "array"):
-                        elem_path = f"{qname}[{elem_idx}]"
-                        self._traverse_node(
-                            node=child,
-                            code_bytes=code_bytes,
-                            current_path=elem_path,
-                            enclosing=qname,
-                            depth=depth + 1,
-                            nodes=nodes,
-                            imports=imports,
-                        )
-                        elem_idx += 1
-            else:
-                for child in val_node.children:
-                    if child.type in ("pair", "object", "array", "ERROR"):
-                        self._traverse_node(
-                            node=child,
-                            code_bytes=code_bytes,
-                            current_path=qname,
-                            enclosing=parent_path,
-                            depth=depth + 1,
-                            nodes=nodes,
-                            imports=imports,
-                        )
-
-    def _handle_ref_import(self, ref_val: str, line_no: int, raw_stmt: str, imports: List[ExtractedImport]) -> None:
-        """Parses JSON Schema $ref values like ./common.json#/definitions/User."""
+    def _handle_ref_import(self, ref_val: str, line_no: int, imports: List[ExtractedImport]) -> None:
         if not ref_val:
             return
-
         file_target = ref_val
         fragment = ""
         if "#" in ref_val:
             file_target, fragment = ref_val.split("#", 1)
-
         file_target = file_target.strip()
         if not file_target:
-            return  # Internal fragment only, e.g. #/definitions/User
-
-        # Determine imported symbols from fragment pointer
+            return
         symbols = ["*"]
         if fragment:
             clean_frag = fragment.lstrip("/").replace("/", ".")
@@ -272,29 +200,25 @@ class JsonParser(BaseParser):
                 leaf = clean_frag.split(".")[-1]
                 if leaf and leaf not in symbols:
                     symbols.append(leaf)
-
         imports.append(
             ExtractedImport(
                 module_path=file_target,
                 imported_symbols=symbols,
+                import_type="relative" if file_target.startswith((".", "/")) else "package",
                 line_number=line_no,
-                is_relative=file_target.startswith(("./", "../")),
-                raw_statement=raw_stmt[:200],
+                raw_statement=f'"$ref": "{ref_val}"',
             )
         )
 
-    def _handle_extends_import(self, ext_val: str, line_no: int, raw_stmt: str, imports: List[ExtractedImport]) -> None:
-        """Parses configuration extends target paths."""
-        ext_val = ext_val.strip()
+    def _handle_extends_import(self, ext_val: str, line_no: int, imports: List[ExtractedImport]) -> None:
         if not ext_val:
             return
-
         imports.append(
             ExtractedImport(
                 module_path=ext_val,
                 imported_symbols=["*"],
+                import_type="relative" if ext_val.startswith((".", "/")) else "package",
                 line_number=line_no,
-                is_relative=ext_val.startswith(("./", "../")),
-                raw_statement=raw_stmt[:200],
+                raw_statement=f'"extends": "{ext_val}"',
             )
         )

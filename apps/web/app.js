@@ -7,6 +7,7 @@ const state = {
   currentWorkspaceId: null,
   currentRepoId: null,
   activeTab: "overview",
+  pollInterval: null,
   graph: {
     nodes: [],
     edges: [],
@@ -118,7 +119,7 @@ async function loadInitialData() {
   }
 }
 
-async function loadRepositories(workspaceId) {
+async function loadRepositories(workspaceId, selectedRepoId = null) {
   try {
     const res = await fetch(`/api/repositories?workspace_id=${workspaceId}`);
     const repos = await res.json();
@@ -142,7 +143,12 @@ async function loadRepositories(workspaceId) {
       repoSelect.appendChild(opt);
     });
 
-    state.currentRepoId = repos[0].id;
+    const targetId = selectedRepoId && repos.some(r => r.id === selectedRepoId)
+      ? selectedRepoId
+      : (state.currentRepoId && repos.some(r => r.id === state.currentRepoId) ? state.currentRepoId : repos[0].id);
+
+    repoSelect.value = targetId;
+    state.currentRepoId = targetId;
     onRepoChanged();
   } catch (err) {
     console.error("Failed loading repositories:", err);
@@ -151,6 +157,7 @@ async function loadRepositories(workspaceId) {
 
 async function onRepoChanged() {
   if (!state.currentRepoId) return;
+  stopPolling();
   await loadOverview(state.currentRepoId);
   if (state.activeTab === "graph") {
     loadInitialGraph(state.currentRepoId);
@@ -163,8 +170,15 @@ async function loadOverview(repoId) {
     const repo = await res.json();
 
     // Update status badge
+    const statusLower = (repo.indexing_status || "").toLowerCase();
     const statusElem = document.getElementById("metric-status");
-    statusElem.innerHTML = `<span class="status-badge status-${repo.indexing_status.toLowerCase()}">${repo.indexing_status}</span>`;
+    statusElem.innerHTML = `<span class="status-badge status-${statusLower}">${repo.indexing_status}</span>`;
+
+    if (statusLower === "indexing" || statusLower === "pending") {
+      startPolling(repoId);
+    } else {
+      stopPolling();
+    }
 
     const stats = repo.stats || {};
     document.getElementById("metric-files").textContent = stats.total_files || 0;
@@ -239,6 +253,35 @@ async function loadOverview(repoId) {
   }
 }
 
+function startPolling(repoId) {
+  if (state.pollInterval) return;
+  state.pollInterval = setInterval(async () => {
+    if (!state.currentRepoId || state.currentRepoId !== repoId) {
+      stopPolling();
+      return;
+    }
+    try {
+      const res = await fetch(`/api/repositories/${repoId}`);
+      if (!res.ok) return;
+      const repo = await res.json();
+      const st = (repo.indexing_status || "").toLowerCase();
+      if (st !== "indexing" && st !== "pending") {
+        stopPolling();
+        await loadRepositories(state.currentWorkspaceId, repoId);
+      }
+    } catch (e) {
+      console.warn("Polling error:", e);
+    }
+  }, 2000);
+}
+
+function stopPolling() {
+  if (state.pollInterval) {
+    clearInterval(state.pollInterval);
+    state.pollInterval = null;
+  }
+}
+
 function renderOverviewEmpty() {
   document.getElementById("metric-status").innerHTML = `<span class="status-badge status-pending">NO REPO</span>`;
   document.getElementById("metric-files").textContent = "0";
@@ -260,7 +303,7 @@ async function reindexCurrentRepo() {
       const err = await res.json();
       alert(`Indexing failed: ${err.detail}`);
     } else {
-      await onRepoChanged();
+      await loadRepositories(state.currentWorkspaceId, state.currentRepoId);
     }
   } catch (err) {
     alert(`Re-indexing error: ${err}`);
@@ -285,6 +328,7 @@ function setupModals() {
     repoModal.classList.remove("active");
   });
   document.getElementById("btn-submit-repo").addEventListener("click", async () => {
+    const btnSubmit = document.getElementById("btn-submit-repo");
     const name = document.getElementById("repo-name-input").value.trim();
     const sourceType = document.getElementById("repo-source-type").value;
     const path = document.getElementById("repo-path-input").value.trim();
@@ -295,6 +339,9 @@ function setupModals() {
       errBox.style.display = "block";
       return;
     }
+
+    btnSubmit.disabled = true;
+    btnSubmit.textContent = "Registering & Indexing...";
 
     try {
       const res = await fetch("/api/repositories", {
@@ -312,18 +359,28 @@ function setupModals() {
         const err = await res.json();
         errBox.textContent = err.detail || "Registration failed.";
         errBox.style.display = "block";
+        btnSubmit.disabled = false;
+        btnSubmit.textContent = "Register & Index";
         return;
       }
 
       const repo = await res.json();
-      repoModal.classList.remove("active");
 
       // Auto-trigger indexing
-      await fetch(`/api/repositories/${repo.id}/index`, { method: "POST" });
-      await loadRepositories(state.currentWorkspaceId);
+      const indexRes = await fetch(`/api/repositories/${repo.id}/index`, { method: "POST" });
+      if (!indexRes.ok) {
+        const indexErr = await indexRes.json();
+        alert(`Repository registered but indexing failed: ${indexErr.detail}`);
+      }
+
+      repoModal.classList.remove("active");
+      await loadRepositories(state.currentWorkspaceId, repo.id);
     } catch (e) {
       errBox.textContent = `Error: ${e}`;
       errBox.style.display = "block";
+    } finally {
+      btnSubmit.disabled = false;
+      btnSubmit.textContent = "Register & Index";
     }
   });
 

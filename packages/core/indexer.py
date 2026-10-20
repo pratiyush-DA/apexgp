@@ -67,12 +67,32 @@ class RepositoryIndexer:
         if not repo:
             raise ValueError(f"Repository {repository_id} not found")
 
-        repo_root = os.path.realpath(repo.source_path)
-        if not os.path.exists(repo_root) or not os.path.isdir(repo_root):
-            repo.indexing_status = "failed"
-            repo.error_message = f"Repository path '{repo.source_path}' does not exist or is not a directory."
-            self.db.commit()
-            return repo
+        if repo.source_type == "git":
+            import subprocess
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            clone_dir = os.path.join(base_dir, "data", "clones", repository_id)
+            os.makedirs(os.path.dirname(clone_dir), exist_ok=True)
+            if not os.path.exists(clone_dir):
+                res = subprocess.run(
+                    ["git", "clone", "--depth", "1", repo.source_path, clone_dir],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    repo.indexing_status = "failed"
+                    repo.error_message = f"Git clone failed: {res.stderr.strip()}"
+                    self.db.commit()
+                    return repo
+            else:
+                subprocess.run(["git", "-C", clone_dir, "pull"], capture_output=True, text=True)
+            repo_root = os.path.realpath(clone_dir)
+        else:
+            repo_root = os.path.realpath(repo.source_path)
+            if not os.path.exists(repo_root) or not os.path.isdir(repo_root):
+                repo.indexing_status = "failed"
+                repo.error_message = f"Repository path '{repo.source_path}' does not exist or is not a directory."
+                self.db.commit()
+                return repo
 
         self._discover_tsconfigs(repo_root)
         self.go_module_name = self._load_go_mod(repo_root)
@@ -123,6 +143,7 @@ class RepositoryIndexer:
                         lines = content.splitlines()
                         line_counts[rel_path] = len(lines)
 
+                        print(f"Indexing: {rel_path}...", flush=True)
                         parse_res = parse_source_file(rel_path, content)
                         if parse_res:
                             all_parse_results[rel_path] = parse_res
@@ -173,6 +194,8 @@ class RepositoryIndexer:
                 runtime_prefix = get_runtime_prefix(parse_res.language)
                 for ex_node in parse_res.nodes:
                     node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
+                    if node_id in nodes_by_id:
+                        continue
                     db_node = GraphNodeModel(
                         id=node_id,
                         repository_id=repository_id,
@@ -2170,9 +2193,13 @@ class RepositoryIndexer:
                 },
             )
             nodes_to_insert = [file_node]
+            inserted_node_ids = {file_node.id}
             runtime_prefix = get_runtime_prefix(parse_res.language)
             for ex_node in parse_res.nodes:
                 node_id = f"{repository_id}:{runtime_prefix}:{rel_path}:{ex_node.qualified_name}"
+                if node_id in inserted_node_ids:
+                    continue
+                inserted_node_ids.add(node_id)
                 db_node = GraphNodeModel(
                     id=node_id,
                     repository_id=repository_id,
