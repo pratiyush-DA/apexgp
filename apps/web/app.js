@@ -26,6 +26,7 @@ const COLOR_MAP = {
   CLASS: "#6366f1",
   INTERFACE: "#06b6d4",
   TYPE: "#8b5cf6",
+  VARIABLE: "#ec4899",
   FILE: "#64748b",
   TEST: "#f59e0b",
   DEFAULT: "#94a3b8",
@@ -538,19 +539,54 @@ function zoom(factor, clientX, clientY) {
 }
 
 function resetGraphView() {
-  state.graph.transform = { x: canvas.width / 2, y: canvas.height / 2, scale: 1 };
+  if (state.graph.selectedNodeId && state.graph.nodeMap.has(state.graph.selectedNodeId)) {
+    const targetNode = state.graph.nodeMap.get(state.graph.selectedNodeId);
+    state.graph.transform = {
+      x: canvas.width / 2 - targetNode.x,
+      y: canvas.height / 2 - targetNode.y,
+      scale: 1,
+    };
+  } else {
+    state.graph.transform = { x: canvas.width / 2, y: canvas.height / 2, scale: 1 };
+  }
   renderGraph();
 }
 
 async function loadInitialGraph(repoId) {
   try {
-    // Find key classes and functions to seed initial graph view
-    const res = await fetch(`/api/repositories/${repoId}/search?q=a&limit=25`);
-    const results = await res.json();
-    if (results.length === 0) return;
+    state.graph.nodes = [];
+    state.graph.edges = [];
+    state.graph.nodeMap.clear();
+    state.graph.selectedNodeId = null;
 
-    const seedId = results[0].node.id;
-    await expandNodeNeighbors(seedId, true);
+    let seedId = null;
+    try {
+      const hubRes = await fetch(`/api/repositories/${repoId}/god-nodes?limit=5&scope=symbol`);
+      if (hubRes.ok) {
+        const hubs = await hubRes.json();
+        if (hubs.length > 0 && hubs[0].node) {
+          seedId = hubs[0].node.id;
+        }
+      }
+    } catch (_) {}
+
+    if (!seedId) {
+      const res = await fetch(`/api/repositories/${repoId}/search?q=a&type=CLASS&limit=10`);
+      const results = await res.json();
+      if (results.length > 0) {
+        seedId = results[0].node.id;
+      } else {
+        const fallbackRes = await fetch(`/api/repositories/${repoId}/search?q=a&limit=10`);
+        const fallbackResults = await fallbackRes.json();
+        if (fallbackResults.length > 0) {
+          seedId = fallbackResults[0].node.id;
+        }
+      }
+    }
+
+    if (seedId) {
+      await expandNodeNeighbors(seedId, true);
+    }
   } catch (err) {
     console.error("Failed loading initial graph seed:", err);
   }
@@ -562,17 +598,19 @@ async function expandNodeNeighbors(nodeId, centerOnNode = false) {
     const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/neighborhood?radius=${radius}&limit=100`);
     const data = await res.json();
 
+    const anchor = state.graph.nodeMap.get(nodeId) || { x: 0, y: 0 };
     data.nodes.forEach((n) => {
       if (!state.graph.nodeMap.has(n.id)) {
+        const isSeed = n.id === nodeId && state.graph.nodes.length === 0;
         const angle = Math.random() * Math.PI * 2;
-        const dist = 50 + Math.random() * 150;
+        const dist = isSeed ? 0 : (70 + Math.random() * 90);
         const newNode = {
           ...n,
-          x: (canvas.width / 2) + Math.cos(angle) * dist,
-          y: (canvas.height / 2) + Math.sin(angle) * dist,
+          x: isSeed ? 0 : (anchor.x + Math.cos(angle) * dist),
+          y: isSeed ? 0 : (anchor.y + Math.sin(angle) * dist),
           vx: 0,
           vy: 0,
-          radius: n.node_type === "CLASS" ? 18 : (n.node_type === "FILE" ? 22 : 14),
+          radius: n.node_type === "CLASS" ? 18 : (n.node_type === "FILE" ? 22 : (n.node_type === "VARIABLE" ? 10 : 14)),
         };
         state.graph.nodes.push(newNode);
         state.graph.nodeMap.set(n.id, newNode);

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from packages.core.database import get_db, init_db
 from packages.core.indexer import RepositoryIndexer
 from packages.core.models import (
+    GodNodeItem,
     GraphNodeModel,
     ImpactAnalysisResult,
     RepositoryModel,
@@ -274,6 +275,20 @@ def analyze_change_impact(
             repo_id=repo_id,
             max_depth=depth,
         )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/repositories/{repo_id}/god-nodes", response_model=List[GodNodeItem])
+def get_repository_god_nodes(
+    repo_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    scope: str = Query("symbol", pattern="^(all|file|symbol)$"),
+    db: Session = Depends(get_db),
+):
+    engine = GraphQueryEngine(db)
+    try:
+        return engine.get_god_nodes(repo_id=repo_id, limit=limit, scope=scope)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
